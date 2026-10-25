@@ -1,0 +1,6 @@
+{
+  "name": "StayFrame",
+  "description": "Smart video playback presence guard that pauses and rewinds playback when you step away, resuming seamlessly when you return.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
