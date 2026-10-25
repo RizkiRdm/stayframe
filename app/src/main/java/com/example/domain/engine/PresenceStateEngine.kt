@@ -172,11 +172,6 @@ class PresenceStateEngine(
             }
         }
 
-        if (!observation.lightingAdequate) {
-            handleUnknownOrObstructed(currentTimeMs, "Poor lighting conditions")
-            return
-        }
-
         if (!observation.faceDetected) {
             handleFaceAbsent(currentTimeMs)
         } else {

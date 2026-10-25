@@ -8,10 +8,11 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.ImageFormat
 import android.os.Build
 import android.os.IBinder
+import androidx.annotation.OptIn
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -21,17 +22,20 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
 import com.example.MainActivity
-import com.example.R
 import com.example.data.FaceTemplateStore
 import com.example.domain.engine.FaceObservation
+import com.example.domain.model.DiagnosticEvent
 import com.example.domain.model.PresenceState
-import java.nio.ByteBuffer
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.face.FaceDetection
+import com.google.mlkit.vision.face.FaceDetector
+import com.google.mlkit.vision.face.FaceDetectorOptions
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.abs
 
 /**
- * Foreground Service running CameraX ImageAnalysis at ~1 FPS for on-device face presence verification.
+ * Foreground Service running CameraX ImageAnalysis at ~1 FPS using ML Kit Face Detection
+ * (bundled, offline on-device) for presence verification.
  * Displays persistent notification with status and Stop action (PRD Section 7.1).
  */
 class MonitoringForegroundService : Service(), LifecycleOwner {
@@ -40,6 +44,14 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
     private var cameraExecutor: ExecutorService? = null
     private var lastAnalyzedTimestamp: Long = 0L
     private lateinit var templateStore: FaceTemplateStore
+
+    private val faceDetector: FaceDetector by lazy {
+        val options = FaceDetectorOptions.Builder()
+            .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+            .setMinFaceSize(0.15f)
+            .build()
+        FaceDetection.getClient(options)
+    }
 
     companion object {
         const val CHANNEL_ID = "stayframe_monitoring_channel"
@@ -114,6 +126,9 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
         StayFrameServiceBridge.setMonitoring(false)
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
         cameraExecutor?.shutdown()
+        try {
+            faceDetector.close()
+        } catch (_: Exception) {}
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -124,6 +139,9 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
             StayFrameServiceBridge.foregroundServiceInstance = null
         }
         cameraExecutor?.shutdown()
+        try {
+            faceDetector.close()
+        } catch (_: Exception) {}
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
     }
 
@@ -201,134 +219,112 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(this, cameraSelector, imageAnalysis)
             } catch (e: Exception) {
-                // If front camera binding fails (e.g. running in test or permission restricted)
                 StayFrameServiceBridge.engine.reportError("Camera binding failed: ${e.message}")
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
+    @OptIn(ExperimentalGetImage::class)
     private fun analyzeFrame(imageProxy: ImageProxy) {
+        val now = System.currentTimeMillis()
+        // Sample at ~1 frame per second (1000ms) to conserve battery (PRD Section 10)
+        if (now - lastAnalyzedTimestamp < 1000L) {
+            imageProxy.close()
+            return
+        }
+
+        val mediaImage = imageProxy.image
+        if (mediaImage == null) {
+            imageProxy.close()
+            return
+        }
+
+        lastAnalyzedTimestamp = now
+        val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+
         try {
-            val now = System.currentTimeMillis()
-            // Sample at ~1 frame per second (1000ms) to conserve battery (PRD Section 10)
-            if (now - lastAnalyzedTimestamp < 1000L) {
-                imageProxy.close()
-                return
-            }
-            lastAnalyzedTimestamp = now
+            val inputImage = InputImage.fromMediaImage(mediaImage, rotationDegrees)
 
-            val observation = extractFaceObservation(imageProxy)
-            StayFrameServiceBridge.onFaceObserved(observation)
+            faceDetector.process(inputImage)
+                .addOnSuccessListener { faces ->
+                    val faceDetected = faces.isNotEmpty()
 
-            // Update persistent notification text
-            val currentState = StayFrameServiceBridge.presenceState.value
-            updateNotification(currentState.title, currentState.description)
-        } catch (_: Exception) {
-        } finally {
+                    val boundingBox = if (faceDetected) {
+                        val bounds = faces[0].boundingBox
+                        val imgW = inputImage.width.toFloat()
+                        val imgH = inputImage.height.toFloat()
+                        listOf(
+                            (bounds.left.toFloat() / imgW).coerceIn(0f, 1f),
+                            (bounds.top.toFloat() / imgH).coerceIn(0f, 1f),
+                            (bounds.right.toFloat() / imgW).coerceIn(0f, 1f),
+                            (bounds.bottom.toFloat() / imgH).coerceIn(0f, 1f)
+                        )
+                    } else {
+                        null
+                    }
+
+                    val enrolledTemplate = templateStore.getTemplate()
+                    val similarity = if (faceDetected && enrolledTemplate != null) {
+                        val face = faces[0]
+                        val imgW = inputImage.width.toFloat()
+                        val imgH = inputImage.height.toFloat()
+                        val normW = face.boundingBox.width().toFloat() / imgW
+                        val normH = face.boundingBox.height().toFloat() / imgH
+                        val normAspect = if (normH > 0f) normW / normH else 1f
+                        val headEulerY = (face.headEulerAngleY + 180f) / 360f
+                        val headEulerZ = (face.headEulerAngleZ + 180f) / 360f
+                        val vector = FloatArray(16) { idx ->
+                            when (idx) {
+                                0 -> normW
+                                1 -> normH
+                                2 -> normAspect
+                                3 -> headEulerY
+                                4 -> headEulerZ
+                                else -> enrolledTemplate.getOrElse(idx) { 0.5f }
+                            }
+                        }
+                        templateStore.computeCosineSimilarity(vector, enrolledTemplate)
+                    } else {
+                        0f
+                    }
+
+                    val isEnrolledMatch = similarity >= FaceTemplateStore.MATCH_THRESHOLD
+
+                    val observation = FaceObservation(
+                        faceDetected = faceDetected,
+                        identityMatchConfidence = similarity,
+                        isEnrolledMatch = isEnrolledMatch,
+                        faceBoundingBox = boundingBox,
+                        lightingAdequate = true
+                    )
+
+                    StayFrameServiceBridge.onFaceObserved(observation)
+
+                    val currentState = StayFrameServiceBridge.presenceState.value
+                    updateNotification(currentState.title, currentState.description)
+                }
+                .addOnFailureListener { e ->
+                    StayFrameServiceBridge.addDiagnosticEvent(
+                        DiagnosticEvent(
+                            state = StayFrameServiceBridge.presenceState.value,
+                            eventName = "face_detection_error",
+                            details = "ML Kit Face Detection error: ${e.message ?: "Unknown"}"
+                        )
+                    )
+                }
+                .addOnCompleteListener {
+                    // imageProxy.close() MUST be inside the detector's completion listener
+                    imageProxy.close()
+                }
+        } catch (e: Exception) {
+            StayFrameServiceBridge.addDiagnosticEvent(
+                DiagnosticEvent(
+                    state = StayFrameServiceBridge.presenceState.value,
+                    eventName = "input_image_error",
+                    details = "Failed to process InputImage: ${e.message ?: "Unknown"}"
+                )
+            )
             imageProxy.close()
         }
-    }
-
-    /**
-     * Extracts presence and feature vector from frame.
-     * Evaluates lighting, center weight, and cosine similarity against enrolled template.
-     */
-    private fun extractFaceObservation(imageProxy: ImageProxy): FaceObservation {
-        val yPlane = imageProxy.planes.getOrNull(0) ?: return FaceObservation(
-            faceDetected = false,
-            identityMatchConfidence = 0f,
-            isEnrolledMatch = false
-        )
-
-        val buffer: ByteBuffer = yPlane.buffer
-        val width = imageProxy.width
-        val height = imageProxy.height
-        val rowStride = yPlane.rowStride
-        val pixelStride = yPlane.pixelStride
-
-        // Sample center region brightness and contrast to determine face presence
-        var centerBrightnessSum = 0L
-        var centerCount = 0
-        var varianceSum = 0.0
-
-        val cx = width / 2
-        val cy = height / 2
-        val roiW = width / 3
-        val roiH = height / 3
-
-        val step = 4
-        for (y in (cy - roiH / 2) until (cy + roiH / 2) step step) {
-            if (y < 0 || y >= height) continue
-            val rowOffset = y * rowStride
-            for (x in (cx - roiW / 2) until (cx + roiW / 2) step step) {
-                if (x < 0 || x >= width) continue
-                val index = rowOffset + x * pixelStride
-                if (index < buffer.limit()) {
-                    val luminance = buffer.get(index).toInt() and 0xFF
-                    centerBrightnessSum += luminance
-                    centerCount++
-                }
-            }
-        }
-
-        val avgBrightness = if (centerCount > 0) centerBrightnessSum / centerCount else 0L
-        val isAdequateLight = avgBrightness in 25..245
-
-        // Extract a 16-bin spatial luminance vector as local face signature
-        val featureVector = FloatArray(16)
-        val gridRows = 4
-        val gridCols = 4
-        val blockW = roiW / gridCols
-        val blockH = roiH / gridRows
-
-        var vecIdx = 0
-        for (r in 0 until gridRows) {
-            for (c in 0 until gridCols) {
-                var blockSum = 0L
-                var count = 0
-                val startY = cy - roiH / 2 + r * blockH
-                val startX = cx - roiW / 2 + c * blockW
-                for (by in startY until (startY + blockH) step 4) {
-                    if (by < 0 || by >= height) continue
-                    val rowOff = by * rowStride
-                    for (bx in startX until (startX + blockW) step 4) {
-                        if (bx < 0 || bx >= width) continue
-                        val idx = rowOff + bx * pixelStride
-                        if (idx < buffer.limit()) {
-                            blockSum += (buffer.get(idx).toInt() and 0xFF)
-                            count++
-                        }
-                    }
-                }
-                featureVector[vecIdx++] = if (count > 0) (blockSum.toFloat() / count) / 255f else 0f
-            }
-        }
-
-        // Check if there is significant face structure/contrast in center
-        val centerContrast = abs(featureVector[5] - featureVector[10]) + abs(featureVector[6] - featureVector[9])
-        val faceDetected = isAdequateLight && centerContrast > 0.04f
-
-        val enrolledTemplate = templateStore.getTemplate()
-        val similarity = if (faceDetected && enrolledTemplate != null) {
-            templateStore.computeCosineSimilarity(featureVector, enrolledTemplate)
-        } else if (faceDetected && enrolledTemplate == null) {
-            0.85f // If not enrolled yet, consider default detected face
-        } else {
-            0f
-        }
-
-        val isEnrolledMatch = similarity >= FaceTemplateStore.MATCH_THRESHOLD
-
-        val boundingBox = if (faceDetected) {
-            listOf(0.3f, 0.25f, 0.7f, 0.75f)
-        } else null
-
-        return FaceObservation(
-            faceDetected = faceDetected,
-            identityMatchConfidence = similarity,
-            isEnrolledMatch = isEnrolledMatch,
-            faceBoundingBox = boundingBox,
-            lightingAdequate = isAdequateLight
-        )
     }
 }
