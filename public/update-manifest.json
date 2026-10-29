@@ -1,0 +1,12 @@
+{
+  "latest_version": "1.0.0",
+  "version_code": 1,
+  "release_tag": "v1.0.0",
+  "apk_name": "StayFrame-v1.0.0-release.apk",
+  "download_url": "https://github.com/stayframe/stayframe/releases/download/v1.0.0/StayFrame-v1.0.0-release.apk",
+  "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "min_supported_version": "1.0.0",
+  "critical_update": false,
+  "released_at": "2026-10-29T00:00:00Z",
+  "release_notes": "StayFrame v1.0.0 initial production release with local face detection and smart playback rewind guard."
+}

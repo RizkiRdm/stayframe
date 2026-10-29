@@ -27,7 +27,7 @@ enum class PresenceState(
     ),
     PRESENT(
         title = "User Present",
-        description = "Enrolled viewer verified in front camera. Playback ongoing.",
+        description = "Viewer present in front camera. Playback ongoing.",
         indicatorColor = StatusGreen
     ),
     ABSENCE_GRACE(
@@ -47,7 +47,7 @@ enum class PresenceState(
     ),
     UNKNOWN(
         title = "Unknown / Obstructed",
-        description = "Camera view obstructed or lighting insufficient to verify identity.",
+        description = "Camera view obstructed or lighting insufficient for presence detection.",
         indicatorColor = StatusAmber
     ),
     ERROR(

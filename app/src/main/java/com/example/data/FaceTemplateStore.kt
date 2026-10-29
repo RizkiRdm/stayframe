@@ -75,6 +75,7 @@ class FaceTemplateStore(private val context: Context) {
 
     /**
      * Encrypt and store the enrolled face feature vector.
+     * Fails closed if Android Keystore or SecretKey is unavailable.
      */
     fun saveTemplate(vector: FloatArray, userName: String = "Primary Viewer"): Boolean {
         return try {
@@ -84,27 +85,18 @@ class FaceTemplateStore(private val context: Context) {
             }
             val rawBytes = byteBuffer.array()
 
-            val secretKey = getSecretKey()
-            if (secretKey != null) {
-                val cipher = Cipher.getInstance(TRANSFORMATION)
-                cipher.init(Cipher.ENCRYPT_MODE, secretKey)
-                val iv = cipher.iv
-                val encryptedBytes = cipher.doFinal(rawBytes)
+            val secretKey = getSecretKey() ?: return false
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+            val iv = cipher.iv
+            val encryptedBytes = cipher.doFinal(rawBytes)
 
-                prefs.edit()
-                    .putString(KEY_ENCRYPTED_TEMPLATE, Base64.encodeToString(encryptedBytes, Base64.NO_WRAP))
-                    .putString(KEY_IV, Base64.encodeToString(iv, Base64.NO_WRAP))
-                    .putLong(KEY_ENROLLED_TIMESTAMP, System.currentTimeMillis())
-                    .putString(KEY_ENROLLED_USER_NAME, userName)
-                    .apply()
-            } else {
-                // Fallback for Robolectric or environments where AndroidKeyStore AES is unmocked
-                prefs.edit()
-                    .putString(KEY_ENCRYPTED_TEMPLATE, Base64.encodeToString(rawBytes, Base64.NO_WRAP))
-                    .putLong(KEY_ENROLLED_TIMESTAMP, System.currentTimeMillis())
-                    .putString(KEY_ENROLLED_USER_NAME, userName)
-                    .apply()
-            }
+            prefs.edit()
+                .putString(KEY_ENCRYPTED_TEMPLATE, Base64.encodeToString(encryptedBytes, Base64.NO_WRAP))
+                .putString(KEY_IV, Base64.encodeToString(iv, Base64.NO_WRAP))
+                .putLong(KEY_ENROLLED_TIMESTAMP, System.currentTimeMillis())
+                .putString(KEY_ENROLLED_USER_NAME, userName)
+                .apply()
             true
         } catch (_: Exception) {
             false
@@ -113,25 +105,19 @@ class FaceTemplateStore(private val context: Context) {
 
     /**
      * Decrypt and load the enrolled face feature vector.
+     * Fails closed if IV, ciphertext, or SecretKey is missing/corrupt.
      */
     fun getTemplate(): FloatArray? {
         val encryptedBase64 = prefs.getString(KEY_ENCRYPTED_TEMPLATE, null) ?: return null
+        val ivBase64 = prefs.getString(KEY_IV, null) ?: return null
         return try {
             val encryptedBytes = Base64.decode(encryptedBase64, Base64.NO_WRAP)
-            val ivBase64 = prefs.getString(KEY_IV, null)
-            val rawBytes = if (ivBase64 != null) {
-                val iv = Base64.decode(ivBase64, Base64.NO_WRAP)
-                val secretKey = getSecretKey()
-                if (secretKey != null) {
-                    val cipher = Cipher.getInstance(TRANSFORMATION)
-                    cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(GCM_TAG_LENGTH, iv))
-                    cipher.doFinal(encryptedBytes)
-                } else {
-                    encryptedBytes
-                }
-            } else {
-                encryptedBytes
-            }
+            val iv = Base64.decode(ivBase64, Base64.NO_WRAP)
+            val secretKey = getSecretKey() ?: return null
+
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(GCM_TAG_LENGTH, iv))
+            val rawBytes = cipher.doFinal(encryptedBytes)
 
             val buffer = ByteBuffer.wrap(rawBytes)
             val floatCount = rawBytes.size / 4
@@ -158,7 +144,7 @@ class FaceTemplateStore(private val context: Context) {
     }
 
     /**
-     * Delete enrollment and cryptographic material completely.
+     * Delete enrollment from preferences and delete cryptographic key from Android Keystore.
      */
     fun deleteTemplate() {
         prefs.edit()
@@ -167,6 +153,15 @@ class FaceTemplateStore(private val context: Context) {
             .remove(KEY_ENROLLED_TIMESTAMP)
             .remove(KEY_ENROLLED_USER_NAME)
             .apply()
+
+        try {
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            if (keyStore.containsAlias(KEY_ALIAS)) {
+                keyStore.deleteEntry(KEY_ALIAS)
+            }
+        } catch (_: Exception) {
+            // Ignored
+        }
     }
 
     /**

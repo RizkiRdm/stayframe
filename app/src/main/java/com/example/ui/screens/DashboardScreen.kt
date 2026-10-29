@@ -69,6 +69,7 @@ import com.example.ui.theme.OceanDriftBrush
 import com.example.ui.theme.PaperWhite
 import com.example.ui.theme.PureWhite
 import com.example.ui.theme.SilverMist
+import com.example.ui.theme.Smoke
 import com.example.ui.theme.StatusAmber
 import com.example.ui.theme.StatusGreen
 import com.example.ui.theme.StatusRed
@@ -96,6 +97,7 @@ fun DashboardScreen(
 
     val cameraPermissionGranted by viewModel.cameraPermissionGranted.collectAsState()
     val notificationListenerGranted by viewModel.notificationListenerGranted.collectAsState()
+    val lastObservation by viewModel.lastObservation.collectAsState()
 
     LazyColumn(
         modifier = modifier
@@ -139,8 +141,8 @@ fun DashboardScreen(
             }
         }
 
-        // Permission & Enrollment Readiness Alert
-        if (!cameraPermissionGranted || !notificationListenerGranted || !isEnrolled) {
+        // Permission Readiness Alert
+        if (!cameraPermissionGranted || !notificationListenerGranted) {
             item {
                 SleeveCard(
                     modifier = Modifier.fillMaxWidth(),
@@ -157,16 +159,15 @@ fun DashboardScreen(
                         Spacer(modifier = Modifier.width(12.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Setup Required",
+                                text = "Permissions Required",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
                                 text = when {
-                                    !cameraPermissionGranted -> "Camera permission required for presence detection."
+                                    !cameraPermissionGranted -> "Camera permission required for on-device presence detection."
                                     !notificationListenerGranted -> "Notification listener access required to control video playback."
-                                    !isEnrolled -> "Enroll your face to enable identity-aware pause and resume."
-                                    else -> "Complete setup to enable full functionality."
+                                    else -> "Complete permission setup to enable playback guard."
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = Graphite
@@ -175,14 +176,8 @@ fun DashboardScreen(
                     }
                     Spacer(modifier = Modifier.height(12.dp))
                     SleevePillButton(
-                        text = if (!isEnrolled) "Enroll Face Now" else "Complete Permissions",
-                        onClick = {
-                            if (!isEnrolled) {
-                                onNavigateToEnrollment()
-                            } else {
-                                onNavigateToSettings()
-                            }
-                        },
+                        text = "Complete Permissions",
+                        onClick = onNavigateToSettings,
                         isPrimary = false,
                         modifier = Modifier.fillMaxWidth(),
                         testTag = "setup_action_button"
@@ -245,7 +240,7 @@ fun DashboardScreen(
                     text = when (presenceState) {
                         PresenceState.INACTIVE -> "Monitoring is off"
                         PresenceState.WAITING_FOR_PLAYER -> "Waiting for video player..."
-                        PresenceState.PRESENT -> "Viewer Verified"
+                        PresenceState.PRESENT -> "Viewer Present"
                         PresenceState.ABSENCE_GRACE -> "Absent ($remainingGraceSeconds s left)"
                         PresenceState.PAUSED_BY_GUARD -> "Paused & Rewound"
                         PresenceState.OTHER_FACE -> "Unrecognized face"
@@ -257,9 +252,13 @@ fun DashboardScreen(
                 )
 
                 Text(
-                    text = presenceState.description,
+                    text = if (presenceState == PresenceState.ERROR) {
+                        viewModel.presenceEngineLastErrorMessage ?: presenceState.description
+                    } else {
+                        presenceState.description
+                    },
                     style = MaterialTheme.typography.bodyMedium,
-                    color = Graphite,
+                    color = if (presenceState == PresenceState.ERROR) StatusRed else Graphite,
                     modifier = Modifier.padding(top = 4.dp, bottom = 16.dp)
                 )
 
@@ -351,10 +350,21 @@ fun DashboardScreen(
 
                 Spacer(modifier = Modifier.height(20.dp))
 
+                // Permission warning if not granted yet
+                if (!isMonitoring && (!cameraPermissionGranted || !notificationListenerGranted)) {
+                    SleeveAnnouncementPill(
+                        text = "Camera & Notification Listener permissions required. Tap to setup in Settings.",
+                        icon = Icons.Default.Warning
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                }
+
                 // Primary Start/Stop Pill Button
                 SleevePillButton(
                     text = if (isMonitoring) "Stop Monitoring" else "Start Monitoring",
-                    onClick = { viewModel.toggleMonitoring() },
+                    onClick = {
+                        viewModel.toggleMonitoring(onRequiresPermissions = onNavigateToSettings)
+                    },
                     isPrimary = !isMonitoring,
                     icon = if (isMonitoring) Icons.Default.Pause else Icons.Default.PlayArrow,
                     modifier = Modifier.fillMaxWidth(),
@@ -400,27 +410,68 @@ fun DashboardScreen(
         // Quick Controls: Detection Mode
         item {
             SleeveCard(modifier = Modifier.fillMaxWidth()) {
-                SleeveEyebrow(text = "DETECTION MODE")
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    SleeveEyebrow(text = "DETECTION MODE")
+                    SleeveBadge(
+                        text = "STRICT COMING SOON",
+                        backgroundColor = PaperWhite,
+                        textColor = Smoke,
+                        borderColor = SilverMist
+                    )
+                }
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = if (detectionMode == DetectionMode.STRICT) {
-                        "Strict: Resumes only when enrolled face matches"
-                    } else {
-                        "Relaxed: Resumes on any face sustained > 2 sec (ignores quick passersby)"
-                    },
+                    text = "Relaxed: Resumes when face presence is sustained > 2 seconds (ignores brief passersby). Strict biometric matching is in development.",
                     style = MaterialTheme.typography.bodySmall,
                     color = Graphite
                 )
                 Spacer(modifier = Modifier.height(12.dp))
-                SleeveToggleGroup(
-                    items = listOf(DetectionMode.STRICT, DetectionMode.RELAXED_FALLBACK),
-                    selectedItem = detectionMode,
-                    onItemSelected = { viewModel.setDetectionMode(it) },
-                    itemLabel = {
-                        if (it == DetectionMode.STRICT) "Strict" else "Relaxed (2s)"
-                    },
-                    testTagPrefix = "detection_mode"
-                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(9999.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(9999.dp))
+                        .padding(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(9999.dp))
+                            .background(OceanDrift)
+                            .padding(vertical = 10.dp)
+                            .testTag("detection_mode_relaxed"),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "Relaxed (2s)",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = PureWhite,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(9999.dp))
+                            .background(Color.Transparent)
+                            .padding(vertical = 10.dp)
+                            .testTag("detection_mode_strict_disabled"),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "Strict (Coming soon)",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = Smoke,
+                            fontWeight = FontWeight.Normal
+                        )
+                    }
+                }
             }
         }
 

@@ -4,6 +4,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.media.session.MediaController
+import android.media.session.MediaSession
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.Handler
@@ -32,6 +33,7 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
     }
 
     private var activeControllers: List<MediaController> = emptyList()
+    private val registeredControllers = mutableMapOf<MediaSession.Token, MediaController>()
 
     companion object {
         fun isNotificationListenerEnabled(context: Context): Boolean {
@@ -68,6 +70,12 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
         super.onListenerDisconnected()
         isBound = false
         StayFrameServiceBridge.listenerServiceInstance = null
+        for (controller in registeredControllers.values) {
+            try {
+                controller.unregisterCallback(sessionCallback)
+            } catch (_: Exception) {}
+        }
+        registeredControllers.clear()
     }
 
     override fun onDestroy() {
@@ -76,6 +84,12 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
         if (StayFrameServiceBridge.listenerServiceInstance == this) {
             StayFrameServiceBridge.listenerServiceInstance = null
         }
+        for (controller in registeredControllers.values) {
+            try {
+                controller.unregisterCallback(sessionCallback)
+            } catch (_: Exception) {}
+        }
+        registeredControllers.clear()
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
@@ -97,12 +111,27 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
             val controllers = mgr.getActiveSessions(comp)
             activeControllers = controllers
 
-            // Register callbacks
-            controllers.forEach { controller ->
-                try {
-                    controller.unregisterCallback(sessionCallback)
-                    controller.registerCallback(sessionCallback, mainHandler)
-                } catch (_: Exception) {}
+            // Register callback once per controller and clean up stale ones
+            val currentTokens = controllers.map { it.sessionToken }.toSet()
+            val iterator = registeredControllers.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (entry.key !in currentTokens) {
+                    try {
+                        entry.value.unregisterCallback(sessionCallback)
+                    } catch (_: Exception) {}
+                    iterator.remove()
+                }
+            }
+
+            for (controller in controllers) {
+                val token = controller.sessionToken
+                if (!registeredControllers.containsKey(token)) {
+                    try {
+                        controller.registerCallback(sessionCallback, mainHandler)
+                        registeredControllers[token] = controller
+                    } catch (_: Exception) {}
+                }
             }
 
             // Find first playing supported session, or any active supported session
@@ -113,7 +142,15 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
                 val isSupported = PlayerRegistry.isSupported(pkg)
                 val playbackState = controller.playbackState
                 val isPlaying = playbackState?.state == PlaybackState.STATE_PLAYING
-                val position = playbackState?.position ?: 0L
+                val basePosition = playbackState?.position ?: 0L
+                val lastUpdateTime = playbackState?.lastPositionUpdateTime ?: 0L
+                val playbackSpeed = playbackState?.playbackSpeed ?: 1.0f
+                val position = com.example.domain.model.MediaPositionEstimator.estimatePosition(
+                    state = playbackState?.state,
+                    basePosition = basePosition,
+                    lastPositionUpdateTime = lastUpdateTime,
+                    playbackSpeed = playbackSpeed
+                )
                 val player = PlayerRegistry.findByPackage(pkg)
 
                 val sessionInfo = ActiveMediaSessionInfo(

@@ -5,7 +5,9 @@ import android.content.Context
 import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import com.example.data.FaceTemplateStore
+import com.example.data.StayFramePreferencesRepository
 import com.example.domain.controller.ScreenTimeoutController
 import com.example.domain.engine.FaceObservation
 import com.example.domain.model.ActiveMediaSessionInfo
@@ -19,12 +21,14 @@ import com.example.service.StayFrameServiceBridge
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 
 class StayFrameViewModel(application: Application) : AndroidViewModel(application) {
 
     private val context: Context get() = getApplication<Application>().applicationContext
     val templateStore = FaceTemplateStore(context)
     val screenTimeoutController = ScreenTimeoutController(context)
+    val preferencesRepository = StayFramePreferencesRepository(context)
 
     // Bridge States
     val presenceState: StateFlow<PresenceState> = StayFrameServiceBridge.presenceState
@@ -36,6 +40,7 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
     val diagnosticEvents: StateFlow<List<DiagnosticEvent>> = StayFrameServiceBridge.diagnosticEvents
     val remainingGraceSeconds: StateFlow<Int> = StayFrameServiceBridge.remainingGraceSeconds
     val sustainedPresenceProgress: StateFlow<Float> = StayFrameServiceBridge.sustainedPresenceProgress
+    val presenceEngineLastErrorMessage: String? get() = StayFrameServiceBridge.engine.lastErrorMessage
 
     // User Settings & Biometrics
     private val _isEnrolled = MutableStateFlow(templateStore.isEnrolled())
@@ -66,6 +71,22 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
         refreshPermissions()
         screenTimeoutController.checkAndRecoverStaleOverride()
         StayFrameServiceBridge.listenerServiceInstance?.refreshActiveSessions()
+
+        // Persisted settings collection
+        viewModelScope.launch {
+            preferencesRepository.preferencesFlow.collect { prefs ->
+                _absenceGracePeriod.value = prefs.gracePeriodSeconds
+                StayFrameServiceBridge.engine.setAbsenceGracePeriod(prefs.gracePeriodSeconds)
+
+                _detectionMode.value = prefs.detectionMode
+                StayFrameServiceBridge.engine.setDetectionMode(prefs.detectionMode)
+
+                StayFrameServiceBridge.setScreenTimeoutMode(prefs.screenTimeoutMode)
+                if (isMonitoring.value) {
+                    screenTimeoutController.applyTimeout(prefs.screenTimeoutMode)
+                }
+            }
+        }
     }
 
     fun refreshPermissions() {
@@ -89,18 +110,32 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun toggleMonitoring() {
+    fun canStartMonitoring(): Boolean {
+        refreshPermissions()
+        return _cameraPermissionGranted.value && _notificationListenerGranted.value
+    }
+
+    fun toggleMonitoring(onRequiresPermissions: (() -> Unit)? = null) {
         if (isMonitoring.value) {
             stopMonitoring()
         } else {
-            startMonitoring()
+            if (canStartMonitoring()) {
+                startMonitoring()
+            } else {
+                onRequiresPermissions?.invoke()
+            }
         }
     }
 
-    fun startMonitoring() {
+    fun startMonitoring(): Boolean {
+        if (!canStartMonitoring()) {
+            StayFrameServiceBridge.engine.reportError("Camera and Notification Listener permissions are required.")
+            return false
+        }
         MonitoringForegroundService.start(context)
         StayFrameServiceBridge.setMonitoring(true)
         screenTimeoutController.applyTimeout(screenTimeoutMode.value)
+        return true
     }
 
     fun stopMonitoring() {
@@ -112,17 +147,26 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
     fun setAbsenceGracePeriod(seconds: Int) {
         _absenceGracePeriod.value = seconds
         StayFrameServiceBridge.engine.setAbsenceGracePeriod(seconds)
+        viewModelScope.launch {
+            preferencesRepository.setAbsenceGracePeriod(seconds)
+        }
     }
 
     fun setDetectionMode(mode: DetectionMode) {
         _detectionMode.value = mode
         StayFrameServiceBridge.engine.setDetectionMode(mode)
+        viewModelScope.launch {
+            preferencesRepository.setDetectionMode(mode)
+        }
     }
 
     fun setScreenTimeoutMode(mode: ScreenTimeoutMode) {
         StayFrameServiceBridge.setScreenTimeoutMode(mode)
         if (isMonitoring.value) {
             screenTimeoutController.applyTimeout(mode)
+        }
+        viewModelScope.launch {
+            preferencesRepository.setScreenTimeoutMode(mode)
         }
     }
 
@@ -153,20 +197,20 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
         StayFrameServiceBridge.addDiagnosticEvent(
             DiagnosticEvent(
                 state = presenceState.value,
-                eventName = "face_deleted",
-                details = "Biometric template and Keystore key wiped completely"
+                eventName = "data_deleted",
+                details = "Template data and Keystore key wiped completely"
             )
         )
     }
 
     /**
-     * One-action full reset of biometric template, diagnostic logs, and settings (PRD PRIV-05)
+     * One-action full reset of local logs, cache, and settings (PRD PRIV-05)
      */
     fun resetAllAppData() {
         deleteEnrollment()
         clearDiagnostics()
         setAbsenceGracePeriod(5)
-        setDetectionMode(DetectionMode.STRICT)
+        setDetectionMode(DetectionMode.RELAXED_FALLBACK)
         setScreenTimeoutMode(ScreenTimeoutMode.OFF)
         screenTimeoutController.restoreTimeout()
     }
@@ -177,16 +221,5 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun clearDiagnostics() {
         StayFrameServiceBridge.clearDiagnosticEvents()
-    }
-
-    /**
-     * Diagnostic testing helper to test presence scenarios in diagnostics tab
-     */
-    fun simulateObservation(observation: FaceObservation) {
-        StayFrameServiceBridge.onFaceObserved(observation)
-    }
-
-    fun simulateActiveSession(session: ActiveMediaSessionInfo) {
-        StayFrameServiceBridge.updateActiveSession(session)
     }
 }

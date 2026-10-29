@@ -9,12 +9,15 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import androidx.annotation.OptIn
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -44,6 +47,9 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
     private var cameraExecutor: ExecutorService? = null
     private var lastAnalyzedTimestamp: Long = 0L
     private lateinit var templateStore: FaceTemplateStore
+    private var cameraRetryCount = 0
+    private val maxCameraRetries = 3
+    private val retryHandler = Handler(Looper.getMainLooper())
 
     private val faceDetector: FaceDetector by lazy {
         val options = FaceDetectorOptions.Builder()
@@ -90,6 +96,9 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
         createNotificationChannel()
     }
 
+    private var lastNotifiedTitle: String? = null
+    private var lastNotifiedDetails: String? = null
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
@@ -100,11 +109,15 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
                 startMonitoringService()
             }
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun startMonitoringService() {
-        val notification = buildNotification(PresenceState.PRESENT.title, "Presence monitoring active")
+        val initialTitle = PresenceState.PRESENT.title
+        val initialDetails = "Presence monitoring active"
+        lastNotifiedTitle = initialTitle
+        lastNotifiedDetails = initialDetails
+        val notification = buildNotification(initialTitle, initialDetails)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIFICATION_ID,
@@ -123,6 +136,9 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
     }
 
     private fun stopMonitoringService() {
+        lastNotifiedTitle = null
+        lastNotifiedDetails = null
+        retryHandler.removeCallbacksAndMessages(null)
         StayFrameServiceBridge.setMonitoring(false)
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
         cameraExecutor?.shutdown()
@@ -135,6 +151,10 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
 
     override fun onDestroy() {
         super.onDestroy()
+        lastNotifiedTitle = null
+        lastNotifiedDetails = null
+        retryHandler.removeCallbacksAndMessages(null)
+        StayFrameServiceBridge.registerPreviewUseCase(null)
         if (StayFrameServiceBridge.foregroundServiceInstance == this) {
             StayFrameServiceBridge.foregroundServiceInstance = null
         }
@@ -163,6 +183,11 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
     }
 
     fun updateNotification(stateTitle: String, details: String) {
+        if (stateTitle == lastNotifiedTitle && details == lastNotifiedDetails) {
+            return
+        }
+        lastNotifiedTitle = stateTitle
+        lastNotifiedDetails = details
         val notification = buildNotification(stateTitle, details)
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
         manager?.notify(NOTIFICATION_ID, notification)
@@ -208,6 +233,9 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
                 val cameraProvider = cameraProviderFuture.get()
                 val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
 
+                val preview = Preview.Builder().build()
+                StayFrameServiceBridge.registerPreviewUseCase(preview)
+
                 val imageAnalysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
@@ -217,11 +245,38 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
                 }
 
                 cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(this, cameraSelector, imageAnalysis)
+                cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis)
+                cameraRetryCount = 0 // Reset on successful binding
             } catch (e: Exception) {
-                StayFrameServiceBridge.engine.reportError("Camera binding failed: ${e.message}")
+                handleCameraErrorWithRetry(e)
             }
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun handleCameraErrorWithRetry(e: Exception) {
+        val errorMsg = e.localizedMessage ?: e.message ?: "Camera binding failed"
+        if (cameraRetryCount < maxCameraRetries) {
+            cameraRetryCount++
+            val backoffMs = (1000L * (1 shl (cameraRetryCount - 1))) // 1s, 2s, 4s
+            StayFrameServiceBridge.addDiagnosticEvent(
+                DiagnosticEvent(
+                    state = StayFrameServiceBridge.presenceState.value,
+                    eventName = "camera_retry",
+                    details = "Camera binding failed ($errorMsg). Retrying attempt $cameraRetryCount of $maxCameraRetries in ${backoffMs / 1000}s..."
+                )
+            )
+            updateNotification("Camera Retrying...", "Attempt $cameraRetryCount/$maxCameraRetries ($errorMsg)")
+            retryHandler.postDelayed({
+                if (StayFrameServiceBridge.isMonitoring.value) {
+                    bindCameraAnalysis()
+                }
+            }, backoffMs)
+        } else {
+            // All retries failed: report actual error to engine and UI
+            val finalError = "Camera failed after $maxCameraRetries attempts: $errorMsg"
+            StayFrameServiceBridge.engine.reportError(finalError)
+            updateNotification("Camera Error", finalError)
+        }
     }
 
     @OptIn(ExperimentalGetImage::class)

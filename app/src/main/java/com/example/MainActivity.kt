@@ -75,7 +75,7 @@ import com.example.ui.theme.StayFrameTheme
 enum class AppDestination(val label: String, val icon: ImageVector) {
     DASHBOARD("Guard", Icons.Default.Home),
     DIAGNOSTICS("Diagnostics", Icons.Default.Visibility),
-    ENROLLMENT("Face ID", Icons.Default.Face),
+    ENROLLMENT("Face ID (Soon)", Icons.Default.Face),
     SETTINGS("Settings", Icons.Default.Settings)
 }
 
@@ -104,14 +104,14 @@ class MainActivity : ComponentActivity() {
 fun StayFrameApp(viewModel: StayFrameViewModel) {
     var currentDestination by remember { mutableStateOf(AppDestination.DASHBOARD) }
 
-    // Runtime Permission Launcher
+    // Runtime Permission Launcher (triggered on explicit user action)
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) {
         viewModel.refreshPermissions()
     }
 
-    LaunchedEffect(Unit) {
+    val requestPermissions: () -> Unit = {
         val permissions = mutableListOf(Manifest.permission.CAMERA)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
@@ -155,7 +155,8 @@ fun StayFrameApp(viewModel: StayFrameViewModel) {
                                 modifier = Modifier.padding(16.dp)
                             )
                             when (currentDestination) {
-                                AppDestination.DASHBOARD -> DashboardScreen(
+                                AppDestination.DASHBOARD,
+                                AppDestination.DIAGNOSTICS -> DashboardScreen(
                                     viewModel = viewModel,
                                     onNavigateToEnrollment = { currentDestination = AppDestination.ENROLLMENT },
                                     onNavigateToDiagnostics = { currentDestination = AppDestination.DIAGNOSTICS },
@@ -167,11 +168,8 @@ fun StayFrameApp(viewModel: StayFrameViewModel) {
                                 )
                                 AppDestination.SETTINGS -> SettingsScreen(
                                     viewModel = viewModel,
-                                    onNavigateBack = { currentDestination = AppDestination.DASHBOARD }
-                                )
-                                AppDestination.DIAGNOSTICS -> DiagnosticsScreen(
-                                    viewModel = viewModel,
-                                    onNavigateBack = { currentDestination = AppDestination.DASHBOARD }
+                                    onNavigateBack = { currentDestination = AppDestination.DASHBOARD },
+                                    onRequestCameraPermission = requestPermissions
                                 )
                             }
                         }
@@ -214,7 +212,8 @@ fun StayFrameApp(viewModel: StayFrameViewModel) {
                             )
                             AppDestination.SETTINGS -> SettingsScreen(
                                 viewModel = viewModel,
-                                onNavigateBack = { currentDestination = AppDestination.DASHBOARD }
+                                onNavigateBack = { currentDestination = AppDestination.DASHBOARD },
+                                onRequestCameraPermission = requestPermissions
                             )
                         }
                     }

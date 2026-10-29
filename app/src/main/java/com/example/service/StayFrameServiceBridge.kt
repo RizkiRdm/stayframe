@@ -1,5 +1,6 @@
 package com.example.service
 
+import androidx.camera.core.Preview
 import com.example.domain.engine.FaceObservation
 import com.example.domain.engine.PresenceEngineCallback
 import com.example.domain.engine.PresenceStateEngine
@@ -20,7 +21,7 @@ object StayFrameServiceBridge {
 
     val engine = PresenceStateEngine(
         absenceGracePeriodSeconds = 5,
-        detectionMode = DetectionMode.STRICT,
+        detectionMode = DetectionMode.RELAXED_FALLBACK,
         callback = object : PresenceEngineCallback {
             override fun onStateChanged(newState: PresenceState, previousState: PresenceState) {
                 _presenceState.value = newState
@@ -121,5 +122,18 @@ object StayFrameServiceBridge {
 
     fun clearDiagnosticEvents() {
         _diagnosticEvents.value = emptyList()
+    }
+
+    private var activePreviewUseCase: Preview? = null
+    private var currentSurfaceProvider: Preview.SurfaceProvider? = null
+
+    fun registerPreviewUseCase(preview: Preview?) {
+        activePreviewUseCase = preview
+        currentSurfaceProvider?.let { preview?.setSurfaceProvider(it) }
+    }
+
+    fun setSurfaceProvider(provider: Preview.SurfaceProvider?) {
+        currentSurfaceProvider = provider
+        activePreviewUseCase?.setSurfaceProvider(provider)
     }
 }

@@ -73,6 +73,7 @@ import com.example.ui.theme.StatusRed
 fun SettingsScreen(
     viewModel: StayFrameViewModel,
     onNavigateBack: () -> Unit,
+    onRequestCameraPermission: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     BackHandler { onNavigateBack() }
@@ -129,15 +130,19 @@ fun SettingsScreen(
         item {
             PermissionCard(
                 title = "Front Camera Access",
-                subtitle = "Required for on-device face verification. Frames never leave memory.",
+                subtitle = "Required for on-device presence detection. Frames are processed in volatile memory and immediately discarded.",
                 isGranted = cameraGranted,
                 actionLabel = "Grant Permission",
                 onAction = {
-                    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                        data = Uri.fromParts("package", context.packageName, null)
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    if (onRequestCameraPermission != null) {
+                        onRequestCameraPermission()
+                    } else {
+                        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.fromParts("package", context.packageName, null)
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        context.startActivity(intent)
                     }
-                    context.startActivity(intent)
                 },
                 testTag = "perm_camera_button"
             )
@@ -224,9 +229,9 @@ fun SettingsScreen(
                         )
                     }
                     SleeveBadge(
-                        text = "VERIFIED",
+                        text = "SUPPORTED",
                         backgroundColor = PaperWhite,
-                        textColor = StatusGreen,
+                        textColor = OceanDrift,
                         borderColor = SilverMist
                     )
                 }
@@ -241,12 +246,12 @@ fun SettingsScreen(
         item {
             SleeveCard(modifier = Modifier.fillMaxWidth()) {
                 Text(
-                    text = "Local Storage & Keystore Wiping",
+                    text = "Local Storage & Data Wiping",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "Delete your face biometric template and clear all local diagnostic events. StayFrame stores zero data off-device.",
+                    text = "Clear local diagnostic logs and any stored application data. StayFrame operates 100% on-device and records zero biometric templates.",
                     style = MaterialTheme.typography.bodySmall,
                     color = Graphite,
                     modifier = Modifier.padding(vertical = 8.dp)
@@ -264,7 +269,7 @@ fun SettingsScreen(
                         testTag = "settings_clear_logs"
                     )
                     SleevePillButton(
-                        text = "Delete Template",
+                        text = "Delete Data",
                         onClick = { showDeleteConfirm = true },
                         isPrimary = false,
                         icon = Icons.Default.Delete,
@@ -292,13 +297,13 @@ fun SettingsScreen(
                     borderColor = StatusRed
                 ) {
                     Text(
-                        text = "Confirm Biometric Wipe",
+                        text = "Confirm Data Wipe",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         color = StatusRed
                     )
                     Text(
-                        text = "This will erase your hardware-backed cryptographic template. You must re-enroll to use strict identity verification.",
+                        text = "This will clear all local diagnostic events, cached configurations, and reset Keystore keys.",
                         style = MaterialTheme.typography.bodySmall,
                         color = Graphite,
                         modifier = Modifier.padding(vertical = 8.dp)

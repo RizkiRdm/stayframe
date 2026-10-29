@@ -27,22 +27,29 @@ interface PresenceEngineCallback {
 
 /**
  * Core Presence State Machine enforcing all rules from PRD Section 7.4,
- * Immediate Rewind-on-Pause, and 2-Second Passerby Filter in Relaxed Mode.
+ * Thread-safety (Point 2), Strict Non-Match Absence Countdown (Point 3),
+ * Low-Light Unblocked Relaxed Resume (Point 4),
+ * and Not-Playing Ownership Guard (Point 5).
  */
 class PresenceStateEngine(
     private var absenceGracePeriodSeconds: Int = 5,
-    private var detectionMode: DetectionMode = DetectionMode.STRICT,
+    private var detectionMode: DetectionMode = DetectionMode.RELAXED_FALLBACK,
     private val callback: PresenceEngineCallback? = null
 ) {
+    private val lock = Any()
+
     var currentState: PresenceState = PresenceState.INACTIVE
+        get() = synchronized(lock) { field }
         private set
 
     /** Active player session being observed */
     var activeSession: ActiveMediaSessionInfo = ActiveMediaSessionInfo()
+        get() = synchronized(lock) { field }
         private set
 
     /** Ownership tracking: Did StayFrame initiate the pause on this exact session? */
     var pauseOwnership: Boolean = false
+        get() = synchronized(lock) { field }
         private set
 
     /** Package name of the media session StayFrame currently owns a pause for */
@@ -50,6 +57,12 @@ class PresenceStateEngine(
 
     /** Manual pause guard: true if player was paused by the user */
     var manualPauseDetected: Boolean = false
+        get() = synchronized(lock) { field }
+        private set
+
+    /** Real error message for UI display (Point 6) */
+    var lastErrorMessage: String? = null
+        get() = synchronized(lock) { field }
         private set
 
     /** Timers and tracking */
@@ -66,26 +79,27 @@ class PresenceStateEngine(
     /** Required sustained presence duration in relaxed fallback mode (filters passersby) */
     private val relaxedSustainedPresenceDurationMs = 2000L
 
-    fun setAbsenceGracePeriod(seconds: Int) {
+    fun setAbsenceGracePeriod(seconds: Int) = synchronized(lock) {
         absenceGracePeriodSeconds = when (seconds) {
             3, 5, 10 -> seconds
             else -> 5
         }
     }
 
-    fun getAbsenceGracePeriodSeconds(): Int = absenceGracePeriodSeconds
+    fun getAbsenceGracePeriodSeconds(): Int = synchronized(lock) { absenceGracePeriodSeconds }
 
-    fun setDetectionMode(mode: DetectionMode) {
+    fun setDetectionMode(mode: DetectionMode) = synchronized(lock) {
         detectionMode = mode
     }
 
-    fun getDetectionMode(): DetectionMode = detectionMode
+    fun getDetectionMode(): DetectionMode = synchronized(lock) { detectionMode }
 
     /**
      * Start monitoring session
      */
-    fun startMonitoring() {
+    fun startMonitoring() = synchronized(lock) {
         if (currentState == PresenceState.INACTIVE || currentState == PresenceState.ERROR) {
+            lastErrorMessage = null
             val nextState = if (activeSession.isSupported && activeSession.isPlaying) {
                 PresenceState.PRESENT
             } else {
@@ -99,7 +113,7 @@ class PresenceStateEngine(
     /**
      * Stop monitoring session
      */
-    fun stopMonitoring() {
+    fun stopMonitoring() = synchronized(lock) {
         if (currentState != PresenceState.INACTIVE) {
             pauseOwnership = false
             ownedPackageName = null
@@ -113,7 +127,7 @@ class PresenceStateEngine(
     /**
      * Update active media session info from NotificationListenerService
      */
-    fun updateActiveMediaSession(session: ActiveMediaSessionInfo) {
+    fun updateActiveMediaSession(session: ActiveMediaSessionInfo) = synchronized(lock) {
         val previous = activeSession
         activeSession = session
 
@@ -160,7 +174,7 @@ class PresenceStateEngine(
     /**
      * Process face observation from camera analysis (sampled ~1 FPS)
      */
-    fun processObservation(observation: FaceObservation, currentTimeMs: Long = System.currentTimeMillis()) {
+    fun processObservation(observation: FaceObservation, currentTimeMs: Long = System.currentTimeMillis()) = synchronized(lock) {
         if (currentState == PresenceState.INACTIVE || currentState == PresenceState.ERROR) return
 
         if (!activeSession.isSupported || activeSession.packageName == null) {
@@ -204,48 +218,87 @@ class PresenceStateEngine(
         }
     }
 
+    /**
+     * Point 5: If player is NOT playing, do NOT set ownership and do NOT enter PAUSED_BY_GUARD
+     */
     private fun triggerAutoPauseAndRewind(currentTimeMs: Long) {
         val targetPackage = activeSession.packageName
-        if (targetPackage != null && activeSession.isSupported && activeSession.isPlaying) {
-            val currentPos = activeSession.playbackPositionMs
-            val rewindOffsetMs = absenceGracePeriodSeconds * 1000L
-            val targetPositionMs = max(0L, currentPos - rewindOffsetMs)
 
-            // 1. Send pause command
-            callback?.onSendPauseCommand(targetPackage, currentPos)
-
-            // 2. Send immediate rewind command (seekTo departure moment)
-            callback?.onSendRewindCommand(targetPackage, targetPositionMs, rewindOffsetMs)
-
-            pauseOwnership = true
-            ownedPackageName = targetPackage
-            manualPauseDetected = false
-
-            logEvent(
-                "auto_pause_and_rewind",
-                "Paused $targetPackage and rewound -${absenceGracePeriodSeconds}s to departure timestamp ($targetPositionMs ms)",
-                rewindOffsetMs
-            )
+        // Guard: if player is not playing or not supported, do NOT set ownership or enter PAUSED_BY_GUARD
+        if (targetPackage == null || !activeSession.isSupported || !activeSession.isPlaying) {
+            pauseOwnership = false
+            ownedPackageName = null
+            logEvent("skip_auto_pause", "Player is not playing (isPlaying=${activeSession.isPlaying}); skipping pause and guard ownership")
+            return
         }
+
+        val currentPos = activeSession.playbackPositionMs
+        val rewindOffsetMs = absenceGracePeriodSeconds * 1000L
+        val targetPositionMs = max(0L, currentPos - rewindOffsetMs)
+
+        // 1. Send pause command
+        callback?.onSendPauseCommand(targetPackage, currentPos)
+
+        // 2. Send immediate rewind command (seekTo departure moment)
+        callback?.onSendRewindCommand(targetPackage, targetPositionMs, rewindOffsetMs)
+
+        pauseOwnership = true
+        ownedPackageName = targetPackage
+        manualPauseDetected = false
+
+        logEvent(
+            "auto_pause_and_rewind",
+            "Paused $targetPackage and rewound -${absenceGracePeriodSeconds}s to departure timestamp ($targetPositionMs ms)",
+            rewindOffsetMs
+        )
 
         transitionTo(PresenceState.PAUSED_BY_GUARD, "Absence grace expired; video paused and rewound")
     }
 
     private fun handleFacePresent(observation: FaceObservation, currentTimeMs: Long) {
-        // Reset absence timer
-        absenceStartTimeMs = 0L
-
         val isStrictMatch = observation.isEnrolledMatch || observation.identityMatchConfidence >= matchThreshold
 
         if (detectionMode == DetectionMode.STRICT) {
             if (isStrictMatch) {
+                // Valid enrolled user in view
+                absenceStartTimeMs = 0L
                 handleStrictUserPresent(currentTimeMs)
             } else {
-                handleUnrecognizedFace("Detected face does not match enrolled user in strict mode")
+                // Point 3: Strict mode non-match is treated as ABSENT (timer grace continues to tick down)
+                handleStrictUnrecognizedFace(currentTimeMs)
             }
         } else {
             // RELAXED_FALLBACK Mode: Any face sustained for > 2 seconds
+            absenceStartTimeMs = 0L
             handleRelaxedFacePresent(currentTimeMs)
+        }
+    }
+
+    /**
+     * Point 3: Non-matching face in strict mode is treated as absent; grace countdown continues
+     */
+    private fun handleStrictUnrecognizedFace(currentTimeMs: Long) {
+        stablePresentStartTimeMs = 0L
+        sustainedPresenceStartTimeMs = 0L
+
+        when (currentState) {
+            PresenceState.PRESENT -> {
+                absenceStartTimeMs = currentTimeMs
+                transitionTo(PresenceState.OTHER_FACE, "Detected face does not match enrolled user; absence grace started")
+                logEvent("unrecognized_face_absent", "Non-matching face in strict mode; starting ${absenceGracePeriodSeconds}s grace countdown")
+            }
+            PresenceState.OTHER_FACE, PresenceState.ABSENCE_GRACE -> {
+                val elapsedMs = currentTimeMs - absenceStartTimeMs
+                val graceLimitMs = absenceGracePeriodSeconds * 1000L
+
+                if (elapsedMs >= graceLimitMs) {
+                    triggerAutoPauseAndRewind(currentTimeMs)
+                }
+            }
+            PresenceState.PAUSED_BY_GUARD -> {
+                // Non-matching face in strict mode never triggers auto-resume
+            }
+            else -> {}
         }
     }
 
@@ -257,15 +310,12 @@ class PresenceStateEngine(
         val stableDuration = currentTimeMs - stablePresentStartTimeMs
 
         if (currentState == PresenceState.PAUSED_BY_GUARD) {
-            // Check manual pause respect
             if (manualPauseDetected) {
-                // Respect manual pause; do not resume
                 logEvent("resume_ignored", "User manually paused playback; automatic resume skipped")
                 transitionTo(PresenceState.PRESENT, "User present (manual pause respected)")
                 return
             }
 
-            // Check if stable present condition is met (1.0s)
             if (stableDuration >= strictStableResumeDurationMs) {
                 triggerAutoResume()
             }
@@ -296,9 +346,10 @@ class PresenceStateEngine(
                 triggerAutoResume()
             }
         } else if (currentState == PresenceState.ABSENCE_GRACE ||
+            currentState == PresenceState.OTHER_FACE ||
             currentState == PresenceState.UNKNOWN
         ) {
-            transitionTo(PresenceState.PRESENT, "Face verified present in relaxed mode")
+            transitionTo(PresenceState.PRESENT, "Sustained face presence detected in relaxed mode")
         }
     }
 
@@ -314,16 +365,14 @@ class PresenceStateEngine(
         resetTimers()
     }
 
-    private fun handleUnrecognizedFace(reason: String) {
-        stablePresentStartTimeMs = 0L
-        sustainedPresenceStartTimeMs = 0L
-
-        if (currentState != PresenceState.PAUSED_BY_GUARD) {
-            transitionTo(PresenceState.OTHER_FACE, reason)
+    /**
+     * Point 4: In RELAXED_FALLBACK mode, low-light / obstruction does not block resume
+     */
+    fun handleUnknownOrObstructed(currentTimeMs: Long, reason: String) = synchronized(lock) {
+        if (detectionMode == DetectionMode.RELAXED_FALLBACK) {
+            // Do not block resume in relaxed mode
+            return
         }
-    }
-
-    private fun handleUnknownOrObstructed(currentTimeMs: Long, reason: String) {
         stablePresentStartTimeMs = 0L
         sustainedPresenceStartTimeMs = 0L
 
@@ -341,7 +390,7 @@ class PresenceStateEngine(
     /**
      * Manual resume by user from app UI or notification
      */
-    fun userRequestResume() {
+    fun userRequestResume() = synchronized(lock) {
         val targetPackage = activeSession.packageName
         if (targetPackage != null && activeSession.isSupported) {
             callback?.onSendPlayCommand(targetPackage)
@@ -352,7 +401,8 @@ class PresenceStateEngine(
         }
     }
 
-    fun reportError(errorMessage: String) {
+    fun reportError(errorMessage: String) = synchronized(lock) {
+        lastErrorMessage = errorMessage
         transitionTo(PresenceState.ERROR, errorMessage)
         logEvent("engine_error", errorMessage)
     }
@@ -381,14 +431,18 @@ class PresenceStateEngine(
         callback?.onDiagnosticLog(event)
     }
 
-    fun getRemainingGraceSeconds(currentTimeMs: Long = System.currentTimeMillis()): Int {
-        if (currentState != PresenceState.ABSENCE_GRACE && currentState != PresenceState.UNKNOWN) return absenceGracePeriodSeconds
+    fun getRemainingGraceSeconds(currentTimeMs: Long = System.currentTimeMillis()): Int = synchronized(lock) {
+        if (currentState != PresenceState.ABSENCE_GRACE &&
+            currentState != PresenceState.UNKNOWN &&
+            currentState != PresenceState.OTHER_FACE
+        ) return absenceGracePeriodSeconds
+
         if (absenceStartTimeMs == 0L) return absenceGracePeriodSeconds
         val elapsed = (currentTimeMs - absenceStartTimeMs) / 1000L
         return max(0L, absenceGracePeriodSeconds - elapsed).toInt()
     }
 
-    fun getSustainedPresenceProgress(currentTimeMs: Long = System.currentTimeMillis()): Float {
+    fun getSustainedPresenceProgress(currentTimeMs: Long = System.currentTimeMillis()): Float = synchronized(lock) {
         if (sustainedPresenceStartTimeMs == 0L) return 0f
         val elapsed = currentTimeMs - sustainedPresenceStartTimeMs
         return (elapsed.toFloat() / relaxedSustainedPresenceDurationMs).coerceIn(0f, 1f)

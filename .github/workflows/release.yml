@@ -1,0 +1,101 @@
+name: StayFrame Release Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    name: Build Signed Release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Grant Execute Permission to Build Scripts
+        run: chmod +x build_apk.sh
+
+      - name: Setup Release Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "[*] Decoding production upload keystore from secrets..."
+            echo "$KEYSTORE_BASE64" | base64 --decode > my-upload-key.jks
+          else
+            echo "[!] No production keystore secret found, generating fallback release keystore..."
+            keytool -genkeypair -v -keystore my-upload-key.jks -alias upload \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "${STORE_PASSWORD:-stayframepass}" \
+              -keypass "${KEY_PASSWORD:-stayframepass}" \
+              -dname "CN=StayFrame, OU=Release, O=StayFrame, C=US"
+            echo "STORE_PASSWORD=${STORE_PASSWORD:-stayframepass}" >> $GITHUB_ENV
+            echo "KEY_PASSWORD=${KEY_PASSWORD:-stayframepass}" >> $GITHUB_ENV
+          fi
+
+      - name: Build Release APK & Compute Checksums
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
+          STORE_PASSWORD: ${{ env.STORE_PASSWORD || secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ env.KEY_PASSWORD || secrets.KEY_PASSWORD }}
+        run: |
+          ./build_apk.sh release
+
+      - name: Generate In-App Update Manifest
+        run: |
+          TAG_NAME="${{ github.ref_name }}"
+          VERSION="${TAG_NAME#v}"
+          APK_FILE=$(ls dist/StayFrame-*-release.apk | head -n1)
+          SHA256_HASH=$(sha256sum "$APK_FILE" | awk '{print $1}')
+          APK_BASENAME=$(basename "$APK_FILE")
+
+          cat <<EOF > dist/update-manifest.json
+          {
+            "latest_version": "$VERSION",
+            "version_code": 1,
+            "release_tag": "$TAG_NAME",
+            "apk_name": "$APK_BASENAME",
+            "download_url": "https://github.com/${{ github.repository }}/releases/download/$TAG_NAME/$APK_BASENAME",
+            "sha256": "$SHA256_HASH",
+            "min_supported_version": "1.0.0",
+            "critical_update": false,
+            "released_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "release_notes": "StayFrame $TAG_NAME production release."
+          }
+          EOF
+
+          echo "[✓] update-manifest.json generated successfully:"
+          cat dist/update-manifest.json
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.apk
+            dist/*.sha256
+            dist/update-manifest.json
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+      - name: Cleanup Secrets and Keystore
+        if: always()
+        run: |
+          shred -u my-upload-key.jks 2>/dev/null || rm -f my-upload-key.jks

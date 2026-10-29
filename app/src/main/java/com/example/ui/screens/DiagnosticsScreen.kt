@@ -42,21 +42,28 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Canvas
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.domain.engine.FaceObservation
-import com.example.domain.model.ActiveMediaSessionInfo
+import androidx.compose.ui.viewinterop.AndroidView
 import com.example.domain.model.DetectionMode
 import com.example.domain.model.PresenceState
+import com.example.service.StayFrameServiceBridge
 import com.example.ui.StayFrameViewModel
 import com.example.ui.components.SleeveAnnouncementPill
 import com.example.ui.components.SleeveBadge
@@ -86,6 +93,12 @@ fun DiagnosticsScreen(
 
     val presenceState by viewModel.presenceState.collectAsState()
     val isPreviewVisible by viewModel.isPreviewVisible.collectAsState()
+
+    DisposableEffect(isPreviewVisible) {
+        onDispose {
+            StayFrameServiceBridge.setSurfaceProvider(null)
+        }
+    }
     val isMonitoring by viewModel.isMonitoring.collectAsState()
     val activeSession by viewModel.activeSession.collectAsState()
     val lastObservation by viewModel.lastObservation.collectAsState()
@@ -177,45 +190,74 @@ fun DiagnosticsScreen(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(220.dp)
+                        .height(240.dp)
                         .clip(RoundedCornerShape(16.dp))
                         .background(if (isPreviewVisible) Color(0xFF1E293B) else PaperWhite)
                         .border(1.dp, SilverMist, RoundedCornerShape(16.dp)),
                     contentAlignment = Alignment.Center
                 ) {
                     if (isPreviewVisible) {
-                        // Diagnostic Visualizer Overlay
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(130.dp)
-                                    .border(
-                                        width = 2.dp,
-                                        color = if (isEnrolledMatch) StatusGreen else if (faceDetected) StatusAmber else Color.Gray,
-                                        shape = RoundedCornerShape(12.dp)
-                                    )
-                                    .padding(8.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Face,
-                                    contentDescription = null,
-                                    tint = if (isEnrolledMatch) StatusGreen else if (faceDetected) StatusAmber else Color.White,
-                                    modifier = Modifier.size(64.dp)
+                        AndroidView(
+                            factory = { ctx ->
+                                PreviewView(ctx).apply {
+                                    implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                                    scaleType = PreviewView.ScaleType.FILL_CENTER
+                                    StayFrameServiceBridge.setSurfaceProvider(this.surfaceProvider)
+                                }
+                            },
+                            modifier = Modifier.fillMaxSize()
+                        )
+
+                        // Real ML Kit Face Bounding Box Overlay
+                        val bbox = lastObservation?.faceBoundingBox
+                        if (faceDetected && bbox != null && bbox.size == 4) {
+                            Canvas(modifier = Modifier.fillMaxSize()) {
+                                val leftNorm = (1f - bbox[2]).coerceIn(0f, 1f)
+                                val rightNorm = (1f - bbox[0]).coerceIn(0f, 1f)
+                                val topNorm = bbox[1].coerceIn(0f, 1f)
+                                val bottomNorm = bbox[3].coerceIn(0f, 1f)
+
+                                val leftPx = leftNorm * size.width
+                                val topPx = topNorm * size.height
+                                val boxWidth = (rightNorm - leftNorm) * size.width
+                                val boxHeight = (bottomNorm - topNorm) * size.height
+
+                                drawRoundRect(
+                                    color = if (isEnrolledMatch) StatusGreen else StatusAmber,
+                                    topLeft = Offset(leftPx, topPx),
+                                    size = Size(boxWidth, boxHeight),
+                                    cornerRadius = CornerRadius(12f, 12f),
+                                    style = Stroke(width = 3.dp.toPx())
                                 )
                             }
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = if (isEnrolledMatch) "VERIFIED USER (${(matchConfidence * 100).toInt()}%)"
-                                else if (faceDetected) "FACE DETECTED • UNVERIFIED (${(matchConfidence * 100).toInt()}%)"
-                                else "NO FACE DETECTED",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (isEnrolledMatch) StatusGreen else if (faceDetected) StatusAmber else PureWhite,
-                                fontWeight = FontWeight.Bold
-                            )
+                        }
+
+                        // Status Telemetry Bar Overlay
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .fillMaxWidth()
+                                .background(Color(0x99000000))
+                                .padding(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = if (faceDetected) "FACE DETECTED (RELAXED MODE)"
+                                    else "NO FACE DETECTED",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (faceDetected) StatusGreen else PureWhite,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = if (isMonitoring) "CAMERA ACTIVE" else "MONITORING OFF",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (isMonitoring) CyanSplash else SilverMist
+                                )
+                            }
                         }
                     } else {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -268,114 +310,23 @@ fun DiagnosticsScreen(
                     )
                 }
 
-                // Card 2: Identity Verification
+                // Card 2: Operating Mode
                 SleeveCard(
                     modifier = Modifier.weight(1f),
                     padding = 16.dp
                 ) {
-                    SleeveEyebrow(text = "VERIFIER")
+                    SleeveEyebrow(text = "MODE")
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = if (isEnrolledMatch) "Match" else if (faceDetected) "Unmatched" else "None",
+                        text = "Relaxed",
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
-                        color = if (isEnrolledMatch) StatusGreen else if (faceDetected) StatusAmber else Graphite
+                        color = StatusGreen
                     )
                     Text(
-                        text = "Cosine confidence ${(matchConfidence * 100).toInt()}%",
+                        text = "2s sustained window • Strict: Soon",
                         style = MaterialTheme.typography.bodySmall,
                         color = Smoke
-                    )
-                }
-            }
-        }
-
-        // Quick Test Simulator Sandbox
-        item {
-            SleeveCard(modifier = Modifier.fillMaxWidth()) {
-                SleeveEyebrow(text = "TEST SIMULATOR SANDBOX")
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = "Verify state transitions without waiting or walking away",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Graphite
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    SleevePillButton(
-                        text = "User Return",
-                        onClick = {
-                            viewModel.simulateObservation(
-                                FaceObservation(
-                                    faceDetected = true,
-                                    identityMatchConfidence = 0.92f,
-                                    isEnrolledMatch = true
-                                )
-                            )
-                        },
-                        isPrimary = false,
-                        modifier = Modifier.weight(1f),
-                        testTag = "sim_user_return"
-                    )
-                    SleevePillButton(
-                        text = "User Absent",
-                        onClick = {
-                            viewModel.simulateObservation(
-                                FaceObservation(
-                                    faceDetected = false,
-                                    identityMatchConfidence = 0f,
-                                    isEnrolledMatch = false
-                                )
-                            )
-                        },
-                        isPrimary = false,
-                        modifier = Modifier.weight(1f),
-                        testTag = "sim_user_absent"
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    SleevePillButton(
-                        text = "Passerby (<2s)",
-                        onClick = {
-                            viewModel.simulateObservation(
-                                FaceObservation(
-                                    faceDetected = true,
-                                    identityMatchConfidence = 0.35f,
-                                    isEnrolledMatch = false
-                                )
-                            )
-                        },
-                        isPrimary = false,
-                        modifier = Modifier.weight(1f),
-                        testTag = "sim_passerby"
-                    )
-                    SleevePillButton(
-                        text = "Toggle Video",
-                        onClick = {
-                            val currentPlaying = activeSession.isPlaying
-                            viewModel.simulateActiveSession(
-                                ActiveMediaSessionInfo(
-                                    packageName = "com.google.android.youtube",
-                                    playerDisplayName = "YouTube",
-                                    isPlaying = !currentPlaying,
-                                    playbackPositionMs = 45000L,
-                                    isSupported = true
-                                )
-                            )
-                        },
-                        isPrimary = false,
-                        modifier = Modifier.weight(1f),
-                        testTag = "sim_toggle_video"
                     )
                 }
             }
@@ -411,7 +362,7 @@ fun DiagnosticsScreen(
                     borderColor = SilverMist
                 ) {
                     Text(
-                        text = "No events logged yet. Start a session or simulate transitions above.",
+                        text = "No events logged yet. Active monitoring events will appear here.",
                         style = MaterialTheme.typography.bodySmall,
                         color = Smoke
                     )

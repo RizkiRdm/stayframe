@@ -1,5 +1,8 @@
 package com.example.domain.model
 
+import android.media.session.PlaybackState
+import android.os.SystemClock
+
 /**
  * Details of a supported video player in the compatibility registry
  */
@@ -67,6 +70,30 @@ object PlayerRegistry {
     fun findByPackage(packageName: String?): SupportedPlayer? {
         if (packageName.isNullOrBlank()) return null
         return SUPPORTED_PLAYERS.find { it.packageName == packageName }
+    }
+}
+
+/**
+ * Pure helper for position extrapolation using:
+ * position + (elapsedRealtime - lastPositionUpdateTime) * playbackSpeed
+ * when state is STATE_PLAYING (Point 1).
+ */
+object MediaPositionEstimator {
+    fun estimatePosition(
+        state: Int?,
+        basePosition: Long,
+        lastPositionUpdateTime: Long,
+        playbackSpeed: Float,
+        currentElapsedRealtime: Long = SystemClock.elapsedRealtime()
+    ): Long {
+        if (state == PlaybackState.STATE_PLAYING && lastPositionUpdateTime > 0L) {
+            val elapsed = currentElapsedRealtime - lastPositionUpdateTime
+            if (elapsed > 0) {
+                val speed = if (playbackSpeed > 0f) playbackSpeed else 1.0f
+                return (basePosition + (elapsed * speed).toLong()).coerceAtLeast(0L)
+            }
+        }
+        return basePosition.coerceAtLeast(0L)
     }
 }
 
