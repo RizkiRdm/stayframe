@@ -17,3 +17,10 @@
 # Coroutines & Serialization
 -keepnames class kotlinx.coroutines.internal.MainDispatcherFactory {}
 -keepnames class kotlinx.coroutines.CoroutineExceptionHandler {}
+
+# WorkManager & Room
+-keep class * extends androidx.work.CoroutineWorker { <init>(...); }
+-keep class * extends androidx.room.RoomDatabase
+-keep @androidx.room.Entity class *
+-dontwarn androidx.room.**
+

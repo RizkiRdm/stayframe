@@ -3,6 +3,7 @@ package com.example.data
 import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.intPreferencesKey
@@ -13,6 +14,7 @@ import com.example.domain.model.ScreenTimeoutMode
 import java.io.IOException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 
 val Context.stayFrameDataStore: DataStore<Preferences> by preferencesDataStore(name = "stayframe_settings")
@@ -20,16 +22,18 @@ val Context.stayFrameDataStore: DataStore<Preferences> by preferencesDataStore(n
 data class StayFramePreferences(
     val gracePeriodSeconds: Int = 5,
     val detectionMode: DetectionMode = DetectionMode.RELAXED_FALLBACK,
-    val screenTimeoutMode: ScreenTimeoutMode = ScreenTimeoutMode.MIN_15
+    val screenTimeoutMode: ScreenTimeoutMode = ScreenTimeoutMode.MIN_15,
+    val isMonitoringArmed: Boolean = false
 )
 
-// Repository for persisting grace period, detection mode, and screen timeout settings via DataStore
+// Repository for persisting grace period, detection mode, screen timeout, and armed monitoring state
 class StayFramePreferencesRepository(private val context: Context) {
 
     companion object {
         val KEY_ABSENCE_GRACE_PERIOD = intPreferencesKey("absence_grace_period_seconds")
         val KEY_DETECTION_MODE = stringPreferencesKey("detection_mode")
         val KEY_SCREEN_TIMEOUT_MODE = stringPreferencesKey("screen_timeout_mode")
+        val KEY_MONITORING_ARMED = booleanPreferencesKey("is_monitoring_armed")
     }
 
     val preferencesFlow: Flow<StayFramePreferences> = context.stayFrameDataStore.data
@@ -64,12 +68,17 @@ class StayFramePreferencesRepository(private val context: Context) {
                 ScreenTimeoutMode.MIN_15
             }
 
+            val isArmed = preferences[KEY_MONITORING_ARMED] ?: false
+
             StayFramePreferences(
                 gracePeriodSeconds = gracePeriod,
                 detectionMode = detectionMode,
-                screenTimeoutMode = screenTimeoutMode
+                screenTimeoutMode = screenTimeoutMode,
+                isMonitoringArmed = isArmed
             )
         }
+
+    suspend fun getSnapshot(): StayFramePreferences = preferencesFlow.first()
 
     suspend fun setAbsenceGracePeriod(seconds: Int) {
         context.stayFrameDataStore.edit { preferences ->
@@ -86,6 +95,12 @@ class StayFramePreferencesRepository(private val context: Context) {
     suspend fun setScreenTimeoutMode(mode: ScreenTimeoutMode) {
         context.stayFrameDataStore.edit { preferences ->
             preferences[KEY_SCREEN_TIMEOUT_MODE] = mode.name
+        }
+    }
+
+    suspend fun setMonitoringArmed(armed: Boolean) {
+        context.stayFrameDataStore.edit { preferences ->
+            preferences[KEY_MONITORING_ARMED] = armed
         }
     }
 }

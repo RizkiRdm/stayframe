@@ -8,6 +8,8 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.FaceTemplateStore
 import com.example.data.StayFramePreferencesRepository
+import com.example.data.registry.DiscoveredPlayerEntity
+import com.example.data.registry.PlayerRegistryRepository
 import com.example.domain.controller.ScreenTimeoutController
 import com.example.domain.engine.FaceObservation
 import com.example.domain.model.ActiveMediaSessionInfo
@@ -15,12 +17,16 @@ import com.example.domain.model.DetectionMode
 import com.example.domain.model.DiagnosticEvent
 import com.example.domain.model.PresenceState
 import com.example.domain.model.ScreenTimeoutMode
+import com.example.domain.model.SyncSource
 import com.example.service.MonitoringForegroundService
+import com.example.service.PlayerRescanWorker
 import com.example.service.StayFrameNotificationListenerService
 import com.example.service.StayFrameServiceBridge
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 class StayFrameViewModel(application: Application) : AndroidViewModel(application) {
@@ -29,6 +35,7 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
     val templateStore = FaceTemplateStore(context)
     val screenTimeoutController = ScreenTimeoutController(context)
     val preferencesRepository = StayFramePreferencesRepository(context)
+    val registryRepository = PlayerRegistryRepository(context)
 
     // Bridge States
     val presenceState: StateFlow<PresenceState> = StayFrameServiceBridge.presenceState
@@ -39,15 +46,27 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
     val lastRewindOffsetMs: StateFlow<Long?> = StayFrameServiceBridge.lastRewindOffsetMs
     val diagnosticEvents: StateFlow<List<DiagnosticEvent>> = StayFrameServiceBridge.diagnosticEvents
     val remainingGraceSeconds: StateFlow<Int> = StayFrameServiceBridge.remainingGraceSeconds
+    val effectiveGraceSeconds: StateFlow<Int> = StayFrameServiceBridge.effectiveGraceSeconds
+    val activeSyncSource: StateFlow<SyncSource> = StayFrameServiceBridge.activeSyncSource
     val sustainedPresenceProgress: StateFlow<Float> = StayFrameServiceBridge.sustainedPresenceProgress
     val presenceEngineLastErrorMessage: String? get() = StayFrameServiceBridge.engine.lastErrorMessage
 
-    // User Settings & Biometrics
+    // Dynamic Player Registry
+    val discoveredPlayers: StateFlow<List<DiscoveredPlayerEntity>> = registryRepository.playersFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private val _isRescanningPlayers = MutableStateFlow(false)
+    val isRescanningPlayers: StateFlow<Boolean> = _isRescanningPlayers.asStateFlow()
+
+    // User Settings & Strict Facial Identity
     private val _isEnrolled = MutableStateFlow(templateStore.isEnrolled())
     val isEnrolled: StateFlow<Boolean> = _isEnrolled.asStateFlow()
 
     private val _enrolledUserName = MutableStateFlow(templateStore.getEnrolledUserName())
     val enrolledUserName: StateFlow<String> = _enrolledUserName.asStateFlow()
+
+    private val _enrolledTimestamp = MutableStateFlow(templateStore.getEnrolledTimestamp())
+    val enrolledTimestamp: StateFlow<Long> = _enrolledTimestamp.asStateFlow()
 
     private val _absenceGracePeriod = MutableStateFlow(StayFrameServiceBridge.engine.getAbsenceGracePeriodSeconds())
     val absenceGracePeriod: StateFlow<Int> = _absenceGracePeriod.asStateFlow()
@@ -71,6 +90,11 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
         refreshPermissions()
         screenTimeoutController.checkAndRecoverStaleOverride()
         StayFrameServiceBridge.listenerServiceInstance?.refreshActiveSessions()
+        PlayerRescanWorker.schedulePeriodicRescan(context)
+
+        viewModelScope.launch {
+            registryRepository.rescanAndValidateRegistry(force = false)
+        }
 
         // Persisted settings collection
         viewModelScope.launch {
@@ -78,8 +102,14 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
                 _absenceGracePeriod.value = prefs.gracePeriodSeconds
                 StayFrameServiceBridge.engine.setAbsenceGracePeriod(prefs.gracePeriodSeconds)
 
-                _detectionMode.value = prefs.detectionMode
-                StayFrameServiceBridge.engine.setDetectionMode(prefs.detectionMode)
+                // Guard against invalid Strict selection if template was deleted
+                val resolvedMode = if (prefs.detectionMode == DetectionMode.STRICT && !templateStore.isEnrolled()) {
+                    DetectionMode.RELAXED_FALLBACK
+                } else {
+                    prefs.detectionMode
+                }
+                _detectionMode.value = resolvedMode
+                StayFrameServiceBridge.engine.setDetectionMode(resolvedMode)
 
                 StayFrameServiceBridge.setScreenTimeoutMode(prefs.screenTimeoutMode)
                 if (isMonitoring.value) {
@@ -102,8 +132,9 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
 
         _writeSettingsGranted.value = screenTimeoutController.hasWriteSettingsPermission()
         _isEnrolled.value = templateStore.isEnrolled()
+        _enrolledTimestamp.value = templateStore.getEnrolledTimestamp()
+        _enrolledUserName.value = templateStore.getEnrolledUserName()
 
-        // MON-08: If camera permission was revoked while monitoring is active, halt safely
         if (isMonitoring.value && !hasCamera) {
             stopMonitoring()
             StayFrameServiceBridge.engine.reportError("Camera permission was revoked. Monitoring halted.")
@@ -132,6 +163,9 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
             StayFrameServiceBridge.engine.reportError("Camera and Notification Listener permissions are required.")
             return false
         }
+        viewModelScope.launch {
+            preferencesRepository.setMonitoringArmed(true)
+        }
         MonitoringForegroundService.start(context)
         StayFrameServiceBridge.setMonitoring(true)
         screenTimeoutController.applyTimeout(screenTimeoutMode.value)
@@ -139,6 +173,9 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun stopMonitoring() {
+        viewModelScope.launch {
+            preferencesRepository.setMonitoringArmed(false)
+        }
         MonitoringForegroundService.stop(context)
         StayFrameServiceBridge.setMonitoring(false)
         screenTimeoutController.restoreTimeout()
@@ -147,12 +184,17 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
     fun setAbsenceGracePeriod(seconds: Int) {
         _absenceGracePeriod.value = seconds
         StayFrameServiceBridge.engine.setAbsenceGracePeriod(seconds)
+        StayFrameServiceBridge.listenerServiceInstance?.refreshActiveSessions()
         viewModelScope.launch {
             preferencesRepository.setAbsenceGracePeriod(seconds)
         }
     }
 
-    fun setDetectionMode(mode: DetectionMode) {
+    fun setDetectionMode(mode: DetectionMode, onRequiresEnrollment: (() -> Unit)? = null) {
+        if (mode == DetectionMode.STRICT && !templateStore.isEnrolled()) {
+            onRequiresEnrollment?.invoke()
+            return
+        }
         _detectionMode.value = mode
         StayFrameServiceBridge.engine.setDetectionMode(mode)
         viewModelScope.launch {
@@ -174,16 +216,62 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
         StayFrameServiceBridge.setPreviewVisible(visible)
     }
 
-    fun enrollFace(name: String, embedding: FloatArray): Boolean {
-        val success = templateStore.saveTemplate(embedding, name)
+    fun rescanPlayers() {
+        if (_isRescanningPlayers.value) return
+        viewModelScope.launch {
+            _isRescanningPlayers.value = true
+            try {
+                registryRepository.rescanAndValidateRegistry(force = true)
+                StayFrameServiceBridge.listenerServiceInstance?.refreshActiveSessions()
+            } finally {
+                _isRescanningPlayers.value = false
+            }
+        }
+    }
+
+    fun setPlayerSyncedInterval(packageName: String, intervalSec: Int?) {
+        viewModelScope.launch {
+            registryRepository.setUserSyncedInterval(packageName, intervalSec)
+            StayFrameServiceBridge.listenerServiceInstance?.refreshActiveSessions()
+            StayFrameServiceBridge.addDiagnosticEvent(
+                DiagnosticEvent(
+                    state = presenceState.value,
+                    eventName = "player_interval_updated",
+                    details = if (intervalSec != null) {
+                        "Synced $packageName interval to ${intervalSec}s"
+                    } else {
+                        "Reset $packageName interval to auto profile/fallback"
+                    }
+                )
+            )
+        }
+    }
+
+    fun setPlayerMonitoringEnabled(packageName: String, enabled: Boolean) {
+        viewModelScope.launch {
+            registryRepository.setPlayerMonitoringEnabled(packageName, enabled)
+            StayFrameServiceBridge.listenerServiceInstance?.refreshActiveSessions()
+        }
+    }
+
+    fun enrollFace(name: String, descriptor: FloatArray, activateStrictMode: Boolean = true): Boolean {
+        val success = templateStore.saveTemplate(descriptor, name)
         if (success) {
             _isEnrolled.value = true
             _enrolledUserName.value = name
+            _enrolledTimestamp.value = templateStore.getEnrolledTimestamp()
+            if (activateStrictMode) {
+                _detectionMode.value = DetectionMode.STRICT
+                StayFrameServiceBridge.engine.setDetectionMode(DetectionMode.STRICT)
+                viewModelScope.launch {
+                    preferencesRepository.setDetectionMode(DetectionMode.STRICT)
+                }
+            }
             StayFrameServiceBridge.addDiagnosticEvent(
                 DiagnosticEvent(
                     state = presenceState.value,
                     eventName = "face_enrolled",
-                    details = "Biometric template registered securely for $name"
+                    details = "Facial geometry profile registered locally for $name"
                 )
             )
         }
@@ -194,18 +282,19 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
         templateStore.deleteTemplate()
         _isEnrolled.value = false
         _enrolledUserName.value = "Primary Viewer"
+        _enrolledTimestamp.value = 0L
+        if (_detectionMode.value == DetectionMode.STRICT) {
+            setDetectionMode(DetectionMode.RELAXED_FALLBACK)
+        }
         StayFrameServiceBridge.addDiagnosticEvent(
             DiagnosticEvent(
                 state = presenceState.value,
                 eventName = "data_deleted",
-                details = "Template data and Keystore key wiped completely"
+                details = "Facial profile data and Keystore key wiped completely"
             )
         )
     }
 
-    /**
-     * One-action full reset of local logs, cache, and settings (PRD PRIV-05)
-     */
     fun resetAllAppData() {
         deleteEnrollment()
         clearDiagnostics()

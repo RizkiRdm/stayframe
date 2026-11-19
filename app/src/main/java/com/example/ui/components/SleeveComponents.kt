@@ -6,23 +6,25 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -31,22 +33,19 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import com.example.ui.theme.CyanSplash
-import com.example.ui.theme.MidnightInk
 import com.example.ui.theme.OceanDrift
-import com.example.ui.theme.PaperWhite
 import com.example.ui.theme.PureWhite
-import com.example.ui.theme.SilverMist
 
 /**
- * Sleeve-style 24dp rounded card with subtle 1dp hairline border
+ * Sleeve-style 24dp rounded card using semantic Material 3 surface/outline colors
  */
 @Composable
 fun SleeveCard(
@@ -61,6 +60,7 @@ fun SleeveCard(
             .clip(RoundedCornerShape(24.dp))
             .border(1.dp, borderColor, RoundedCornerShape(24.dp)),
         color = backgroundColor,
+        contentColor = MaterialTheme.colorScheme.onSurface,
         shape = RoundedCornerShape(24.dp),
         tonalElevation = 0.dp,
         shadowElevation = 0.dp
@@ -73,7 +73,7 @@ fun SleeveCard(
 }
 
 /**
- * Sleeve Eyebrow label - uppercase, 0.05em tracking, Ocean Drift accent
+ * Sleeve Eyebrow label - uppercase, tracking, Ocean Drift accent
  */
 @Composable
 fun SleeveEyebrow(
@@ -91,7 +91,7 @@ fun SleeveEyebrow(
 }
 
 /**
- * Sleeve Primary filled pill button (#000000 with white text) or Outlined variant
+ * Sleeve Primary filled pill button or Outlined variant (48dp min interactive target)
  */
 @Composable
 fun SleevePillButton(
@@ -108,7 +108,11 @@ fun SleevePillButton(
     } else {
         Color.Transparent
     }
-    val textColor = if (isPrimary) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onBackground
+    val textColor = if (isPrimary) {
+        MaterialTheme.colorScheme.onPrimary
+    } else {
+        if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
+    }
     val borderModifier = if (!isPrimary) {
         Modifier.border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(9999.dp))
     } else Modifier
@@ -116,6 +120,7 @@ fun SleevePillButton(
     Surface(
         modifier = modifier
             .defaultMinSize(minHeight = 48.dp)
+            .minimumInteractiveComponentSize()
             .clip(RoundedCornerShape(9999.dp))
             .then(borderModifier)
             .testTag(testTag)
@@ -124,7 +129,7 @@ fun SleevePillButton(
         shape = RoundedCornerShape(9999.dp)
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp),
+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center
         ) {
@@ -133,7 +138,7 @@ fun SleevePillButton(
                     imageVector = icon,
                     contentDescription = null,
                     tint = textColor,
-                    modifier = Modifier.size(20.dp)
+                    modifier = Modifier.size(18.dp)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
             }
@@ -141,7 +146,9 @@ fun SleevePillButton(
                 text = text,
                 style = MaterialTheme.typography.labelLarge,
                 color = textColor,
-                fontWeight = FontWeight.SemiBold
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
     }
@@ -154,9 +161,9 @@ fun SleevePillButton(
 fun SleeveBadge(
     text: String,
     modifier: Modifier = Modifier,
-    backgroundColor: Color = PaperWhite,
-    textColor: Color = MidnightInk,
-    borderColor: Color = SilverMist,
+    backgroundColor: Color = MaterialTheme.colorScheme.surfaceVariant,
+    textColor: Color = MaterialTheme.colorScheme.onSurfaceVariant,
+    borderColor: Color = MaterialTheme.colorScheme.outline,
     brush: Brush? = null,
     icon: ImageVector? = null
 ) {
@@ -171,7 +178,7 @@ fun SleeveBadge(
             .clip(RoundedCornerShape(9999.dp))
             .then(backgroundModifier)
             .border(1.dp, borderColor, RoundedCornerShape(9999.dp))
-            .padding(horizontal = 12.dp, vertical = 6.dp),
+            .padding(horizontal = 10.dp, vertical = 5.dp),
         contentAlignment = Alignment.Center
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -180,23 +187,27 @@ fun SleeveBadge(
                     imageVector = icon,
                     contentDescription = null,
                     tint = textColor,
-                    modifier = Modifier.size(14.dp)
+                    modifier = Modifier.size(13.dp)
                 )
-                Spacer(modifier = Modifier.width(6.dp))
+                Spacer(modifier = Modifier.width(5.dp))
             }
             Text(
                 text = text,
                 style = MaterialTheme.typography.labelMedium,
                 color = textColor,
-                fontWeight = FontWeight.SemiBold
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
     }
 }
 
 /**
- * Sleeve Size / Mode Toggle Button Row (e.g. 3s / 5s / 10s or Strict / Relaxed)
+ * Responsive Toggle Button Group: renders as an even segmented pill Row when width allows,
+ * and gracefully wraps via FlowRow on narrow phones (< 380dp) or high accessibility font scales.
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun <T> SleeveToggleGroup(
     items: List<T>,
@@ -204,47 +215,103 @@ fun <T> SleeveToggleGroup(
     onItemSelected: (T) -> Unit,
     itemLabel: (T) -> String,
     modifier: Modifier = Modifier,
-    testTagPrefix: String = "toggle"
+    testTagPrefix: String = "toggle",
+    enabledPredicate: (T) -> Boolean = { true }
 ) {
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(9999.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(9999.dp))
-            .padding(4.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp)
-    ) {
-        items.forEach { item ->
-            val isSelected = item == selectedItem
-            val animatedBg by animateColorAsState(
-                targetValue = if (isSelected) OceanDrift else Color.Transparent,
-                label = "toggle_bg"
-            )
-            val animatedText by animateColorAsState(
-                targetValue = if (isSelected) PureWhite else MaterialTheme.colorScheme.onSurfaceVariant,
-                label = "toggle_text"
-            )
+    val fontScale = LocalDensity.current.fontScale
 
-            Box(
+    BoxWithConstraints(modifier = modifier.fillMaxWidth()) {
+        val shouldWrap = maxWidth < 360.dp || (items.size >= 4 && maxWidth < 430.dp) || fontScale > 1.2f
+
+        if (!shouldWrap) {
+            Row(
                 modifier = Modifier
-                    .weight(1f)
-                    .defaultMinSize(minHeight = 40.dp)
+                    .fillMaxWidth()
                     .clip(RoundedCornerShape(9999.dp))
-                    .background(animatedBg)
-                    .testTag("${testTagPrefix}_${itemLabel(item)}")
-                    .clickable(role = Role.RadioButton, onClick = { onItemSelected(item) }),
-                contentAlignment = Alignment.Center
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(9999.dp))
+                    .padding(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                Text(
-                    text = itemLabel(item),
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-                    color = animatedText,
-                    textAlign = TextAlign.Center
-                )
+                items.forEach { item ->
+                    TogglePillItem(
+                        label = itemLabel(item),
+                        isSelected = item == selectedItem,
+                        enabled = enabledPredicate(item),
+                        testTag = "${testTagPrefix}_${itemLabel(item)}",
+                        onClick = { onItemSelected(item) },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        } else {
+            FlowRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(20.dp))
+                    .padding(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                items.forEach { item ->
+                    TogglePillItem(
+                        label = itemLabel(item),
+                        isSelected = item == selectedItem,
+                        enabled = enabledPredicate(item),
+                        testTag = "${testTagPrefix}_${itemLabel(item)}",
+                        onClick = { onItemSelected(item) },
+                        modifier = Modifier.widthIn(min = 76.dp)
+                    )
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun TogglePillItem(
+    label: String,
+    isSelected: Boolean,
+    enabled: Boolean,
+    testTag: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val animatedBg by animateColorAsState(
+        targetValue = if (isSelected) OceanDrift else Color.Transparent,
+        label = "toggle_bg"
+    )
+    val targetTextColor = when {
+        isSelected -> PureWhite
+        !enabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val animatedText by animateColorAsState(
+        targetValue = targetTextColor,
+        label = "toggle_text"
+    )
+
+    Box(
+        modifier = modifier
+            .defaultMinSize(minHeight = 44.dp)
+            .clip(RoundedCornerShape(9999.dp))
+            .background(animatedBg)
+            .testTag(testTag)
+            .clickable(enabled = enabled, role = Role.RadioButton, onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+            color = animatedText,
+            textAlign = TextAlign.Center,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
 
@@ -265,11 +332,11 @@ fun SleeveAnnouncementPill(
     Surface(
         modifier = modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(9999.dp))
-            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(9999.dp))
+            .clip(RoundedCornerShape(20.dp))
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(20.dp))
             .then(clickModifier),
         color = MaterialTheme.colorScheme.surfaceVariant,
-        shape = RoundedCornerShape(9999.dp)
+        shape = RoundedCornerShape(20.dp)
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),

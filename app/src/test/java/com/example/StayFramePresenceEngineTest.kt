@@ -244,6 +244,106 @@ class StayFramePresenceEngineTest {
     }
 
     // =========================================================================
+    // ADAPTIVE INTERVAL SYNC & UNSEEKABLE STREAM TESTS
+    // =========================================================================
+    @Test
+    fun testAdaptiveSync_AppliesPlayerEffectiveIntervalAndUpdatesMidSession() {
+        engine.setAbsenceGracePeriod(10) // App global = 10s
+        engine.startMonitoring()
+
+        // Active player specifies 5s synced interval -> overrides app's 10s
+        engine.updateActiveMediaSession(
+            ActiveMediaSessionInfo(
+                packageName = "com.google.android.youtube",
+                playerDisplayName = "YouTube",
+                isPlaying = true,
+                playbackPositionMs = 40000L,
+                isSupported = true,
+                canSeek = true,
+                effectiveIntervalSeconds = 5,
+                syncSource = com.example.domain.model.SyncSource.PLAYER_USER_SYNCED
+            )
+        )
+        assertEquals(5, engine.effectiveGracePeriodSeconds)
+
+        val t0 = 100000L
+        engine.processObservation(FaceObservation(false, 0f, false), t0)
+        assertEquals(PresenceState.ABSENCE_GRACE, engine.currentState)
+        engine.processObservation(FaceObservation(false, 0f, false), t0 + 5000L)
+
+        // Paused at 5s and rewound -5000ms (to 35000L) despite global 10s setting
+        assertEquals(PresenceState.PAUSED_BY_GUARD, engine.currentState)
+        assertEquals(35000L, lastRewindTargetMs)
+        assertEquals(5000L, lastRewindOffsetMs)
+    }
+
+    @Test
+    fun testUnseekableStream_PausesWithoutRewindCommand() {
+        engine.startMonitoring()
+        engine.updateActiveMediaSession(
+            ActiveMediaSessionInfo(
+                packageName = "com.google.android.youtube",
+                playerDisplayName = "YouTube Live",
+                isPlaying = true,
+                playbackPositionMs = 15000L,
+                isSupported = true,
+                canSeek = false
+            )
+        )
+
+        val t0 = 100000L
+        engine.processObservation(FaceObservation(false, 0f, false), t0)
+        engine.processObservation(FaceObservation(false, 0f, false), t0 + 5100L)
+
+        assertEquals(PresenceState.PAUSED_BY_GUARD, engine.currentState)
+        assertEquals("com.google.android.youtube", lastPausePackage)
+        assertEquals(null, lastRewindPackage)
+    }
+
+    @Test
+    fun testPersistentMonitoring_AppSwitchAndIntentionalPausePreservedOnReturn() {
+        engine.startMonitoring()
+        val playing = ActiveMediaSessionInfo(
+            packageName = "org.videolan.vlc",
+            playerDisplayName = "VLC",
+            isPlaying = true,
+            playbackPositionMs = 20000L,
+            isSupported = true
+        )
+        engine.updateActiveMediaSession(playing)
+        assertEquals(PresenceState.PRESENT, engine.currentState)
+
+        // User intentionally pauses VLC, then switches to another app (no active session)
+        engine.updateActiveMediaSession(playing.copy(isPlaying = false))
+        assertTrue(engine.manualPauseDetected)
+
+        engine.updateActiveMediaSession(ActiveMediaSessionInfo(packageName = null, isSupported = false))
+        assertEquals(PresenceState.PLAYER_IN_BACKGROUND, engine.currentState)
+
+        // User returns to VLC while still paused
+        engine.updateActiveMediaSession(playing.copy(isPlaying = false))
+        assertEquals(PresenceState.PLAYER_DETECTED, engine.currentState)
+        assertEquals(null, lastPlayPackage)
+    }
+
+    @Test
+    fun testRecoveryState_TransitionsCleanlyOnReconnectedSession() {
+        engine.beginRecovery()
+        assertEquals(PresenceState.RECOVERING, engine.currentState)
+
+        engine.updateActiveMediaSession(
+            ActiveMediaSessionInfo(
+                packageName = "com.google.android.youtube",
+                playerDisplayName = "YouTube",
+                isPlaying = true,
+                playbackPositionMs = 12000L,
+                isSupported = true
+            )
+        )
+        assertEquals(PresenceState.PRESENT, engine.currentState)
+    }
+
+    // =========================================================================
     // LIVE POSITION EXTRAPOLATION TESTS
     // =========================================================================
     @Test

@@ -26,6 +26,9 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
 import com.example.MainActivity
 import com.example.data.FaceTemplateStore
+import com.example.data.StayFramePreferencesRepository
+import com.example.domain.biometrics.DescriptorExtractionResult
+import com.example.domain.biometrics.FaceDescriptorExtractor
 import com.example.domain.engine.FaceObservation
 import com.example.domain.model.DiagnosticEvent
 import com.example.domain.model.PresenceState
@@ -35,11 +38,16 @@ import com.google.mlkit.vision.face.FaceDetector
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 /**
- * Foreground Service running CameraX ImageAnalysis at ~1 FPS using ML Kit Face Detection
- * (bundled, offline on-device) for presence verification.
- * Displays persistent notification with status and Stop action (PRD Section 7.1).
+ * Foreground Service running CameraX ImageAnalysis at ~1 FPS using bundled ML Kit
+ * Face Detection (landmarks + contours) for Relaxed and Strict Mode presence guard.
+ * Supports standby camera hysteresis when user switches away from video players.
  */
 class MonitoringForegroundService : Service(), LifecycleOwner {
 
@@ -47,13 +55,26 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
     private var cameraExecutor: ExecutorService? = null
     private var lastAnalyzedTimestamp: Long = 0L
     private lateinit var templateStore: FaceTemplateStore
+    private lateinit var preferencesRepository: StayFramePreferencesRepository
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     private var cameraRetryCount = 0
     private val maxCameraRetries = 3
-    private val retryHandler = Handler(Looper.getMainLooper())
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var cameraProvider: ProcessCameraProvider? = null
+
+    @Volatile
+    private var isCameraBound = false
+
+    private val standbyReleaseRunnable = Runnable {
+        releaseCameraForStandby()
+    }
 
     private val faceDetector: FaceDetector by lazy {
         val options = FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+            .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
+            .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
             .setMinFaceSize(0.15f)
             .build()
         FaceDetection.getClient(options)
@@ -64,6 +85,7 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
         const val NOTIFICATION_ID = 1001
         const val ACTION_START = "com.example.action.START_MONITORING"
         const val ACTION_STOP = "com.example.action.STOP_MONITORING"
+        private const val STANDBY_CAMERA_RELEASE_DELAY_MS = 15_000L
 
         fun start(context: Context) {
             val intent = Intent(context, MonitoringForegroundService::class.java).apply {
@@ -92,6 +114,7 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
         lifecycleRegistry.currentState = Lifecycle.State.CREATED
         cameraExecutor = Executors.newSingleThreadExecutor()
         templateStore = FaceTemplateStore(applicationContext)
+        preferencesRepository = StayFramePreferencesRepository(applicationContext)
         StayFrameServiceBridge.foregroundServiceInstance = this
         createNotificationChannel()
     }
@@ -102,19 +125,21 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
+                serviceScope.launch { preferencesRepository.setMonitoringArmed(false) }
                 stopMonitoringService()
                 return START_NOT_STICKY
             }
             ACTION_START -> {
                 startMonitoringService()
+                return START_REDELIVER_INTENT
             }
         }
         return START_NOT_STICKY
     }
 
     private fun startMonitoringService() {
-        val initialTitle = PresenceState.PRESENT.title
-        val initialDetails = "Presence monitoring active"
+        val initialTitle = PresenceState.WAITING_FOR_PLAYER.title
+        val initialDetails = "Guard armed and observing active media"
         lastNotifiedTitle = initialTitle
         lastNotifiedDetails = initialDetails
         val notification = buildNotification(initialTitle, initialDetails)
@@ -131,14 +156,81 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
         lifecycleRegistry.currentState = Lifecycle.State.STARTED
         lifecycleRegistry.currentState = Lifecycle.State.RESUMED
 
-        StayFrameServiceBridge.setMonitoring(true)
+        serviceScope.launch {
+            val prefs = preferencesRepository.getSnapshot()
+            preferencesRepository.setMonitoringArmed(true)
+            StayFrameServiceBridge.engine.setAbsenceGracePeriod(prefs.gracePeriodSeconds)
+            StayFrameServiceBridge.engine.setDetectionMode(prefs.detectionMode)
+            mainHandler.post {
+                StayFrameServiceBridge.setMonitoring(true)
+                StayFrameServiceBridge.listenerServiceInstance?.refreshActiveSessions()
+                val state = StayFrameServiceBridge.presenceState.value
+                updateNotification(state.title, state.description)
+                onPresenceStateChanged(state, PresenceState.INACTIVE)
+            }
+        }
+
         bindCameraAnalysis()
+    }
+
+    fun onPresenceStateChanged(newState: PresenceState, previousState: PresenceState) {
+        mainHandler.post {
+            updateNotification(newState.title, newState.description)
+
+            when (newState) {
+                PresenceState.PLAYER_IN_BACKGROUND,
+                PresenceState.WAITING_FOR_PLAYER,
+                PresenceState.PLAYER_DETECTED,
+                PresenceState.PLAYER_UNAVAILABLE -> {
+                    // Keep monitoring service alive in standby and release camera after hysteresis
+                    mainHandler.removeCallbacks(standbyReleaseRunnable)
+                    mainHandler.postDelayed(standbyReleaseRunnable, STANDBY_CAMERA_RELEASE_DELAY_MS)
+                }
+                PresenceState.PRESENT,
+                PresenceState.ABSENCE_GRACE,
+                PresenceState.PAUSED_BY_GUARD,
+                PresenceState.OTHER_FACE,
+                PresenceState.UNKNOWN -> {
+                    mainHandler.removeCallbacks(standbyReleaseRunnable)
+                    if (!isCameraBound && StayFrameServiceBridge.isMonitoring.value) {
+                        bindCameraAnalysis()
+                    }
+                }
+                else -> {}
+            }
+        }
+    }
+
+    private fun releaseCameraForStandby() {
+        val state = StayFrameServiceBridge.presenceState.value
+        val shouldStandby = state == PresenceState.PLAYER_IN_BACKGROUND ||
+            state == PresenceState.WAITING_FOR_PLAYER ||
+            state == PresenceState.PLAYER_DETECTED ||
+            state == PresenceState.PLAYER_UNAVAILABLE
+
+        if (shouldStandby && isCameraBound) {
+            try {
+                cameraProvider?.unbindAll()
+                isCameraBound = false
+                StayFrameServiceBridge.addDiagnosticEvent(
+                    DiagnosticEvent(
+                        state = state,
+                        eventName = "camera_standby_released",
+                        details = "Camera hardware released in standby to save battery"
+                    )
+                )
+            } catch (_: Exception) {}
+        }
     }
 
     private fun stopMonitoringService() {
         lastNotifiedTitle = null
         lastNotifiedDetails = null
-        retryHandler.removeCallbacksAndMessages(null)
+        mainHandler.removeCallbacksAndMessages(null)
+        try {
+            cameraProvider?.unbindAll()
+        } catch (_: Exception) {}
+        isCameraBound = false
         StayFrameServiceBridge.setMonitoring(false)
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
         cameraExecutor?.shutdown()
@@ -153,7 +245,11 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
         super.onDestroy()
         lastNotifiedTitle = null
         lastNotifiedDetails = null
-        retryHandler.removeCallbacksAndMessages(null)
+        mainHandler.removeCallbacksAndMessages(null)
+        try {
+            cameraProvider?.unbindAll()
+        } catch (_: Exception) {}
+        isCameraBound = false
         StayFrameServiceBridge.registerPreviewUseCase(null)
         if (StayFrameServiceBridge.foregroundServiceInstance == this) {
             StayFrameServiceBridge.foregroundServiceInstance = null
@@ -162,6 +258,7 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
         try {
             faceDetector.close()
         } catch (_: Exception) {}
+        serviceScope.cancel()
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
     }
 
@@ -230,7 +327,8 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             try {
-                val cameraProvider = cameraProviderFuture.get()
+                val provider = cameraProviderFuture.get()
+                cameraProvider = provider
                 val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
 
                 val preview = Preview.Builder().build()
@@ -244,10 +342,12 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
                     analyzeFrame(imageProxy)
                 }
 
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis)
-                cameraRetryCount = 0 // Reset on successful binding
+                provider.unbindAll()
+                provider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis)
+                isCameraBound = true
+                cameraRetryCount = 0
             } catch (e: Exception) {
+                isCameraBound = false
                 handleCameraErrorWithRetry(e)
             }
         }, ContextCompat.getMainExecutor(this))
@@ -257,7 +357,7 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
         val errorMsg = e.localizedMessage ?: e.message ?: "Camera binding failed"
         if (cameraRetryCount < maxCameraRetries) {
             cameraRetryCount++
-            val backoffMs = (1000L * (1 shl (cameraRetryCount - 1))) // 1s, 2s, 4s
+            val backoffMs = (1000L * (1 shl (cameraRetryCount - 1)))
             StayFrameServiceBridge.addDiagnosticEvent(
                 DiagnosticEvent(
                     state = StayFrameServiceBridge.presenceState.value,
@@ -266,13 +366,12 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
                 )
             )
             updateNotification("Camera Retrying...", "Attempt $cameraRetryCount/$maxCameraRetries ($errorMsg)")
-            retryHandler.postDelayed({
+            mainHandler.postDelayed({
                 if (StayFrameServiceBridge.isMonitoring.value) {
                     bindCameraAnalysis()
                 }
             }, backoffMs)
         } else {
-            // All retries failed: report actual error to engine and UI
             val finalError = "Camera failed after $maxCameraRetries attempts: $errorMsg"
             StayFrameServiceBridge.engine.reportError(finalError)
             updateNotification("Camera Error", finalError)
@@ -282,7 +381,6 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
     @OptIn(ExperimentalGetImage::class)
     private fun analyzeFrame(imageProxy: ImageProxy) {
         val now = System.currentTimeMillis()
-        // Sample at ~1 frame per second (1000ms) to conserve battery (PRD Section 10)
         if (now - lastAnalyzedTimestamp < 1000L) {
             imageProxy.close()
             return
@@ -306,8 +404,8 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
 
                     val boundingBox = if (faceDetected) {
                         val bounds = faces[0].boundingBox
-                        val imgW = inputImage.width.toFloat()
-                        val imgH = inputImage.height.toFloat()
+                        val imgW = inputImage.width.toFloat().coerceAtLeast(1f)
+                        val imgH = inputImage.height.toFloat().coerceAtLeast(1f)
                         listOf(
                             (bounds.left.toFloat() / imgW).coerceIn(0f, 1f),
                             (bounds.top.toFloat() / imgH).coerceIn(0f, 1f),
@@ -320,25 +418,12 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
 
                     val enrolledTemplate = templateStore.getTemplate()
                     val similarity = if (faceDetected && enrolledTemplate != null) {
-                        val face = faces[0]
-                        val imgW = inputImage.width.toFloat()
-                        val imgH = inputImage.height.toFloat()
-                        val normW = face.boundingBox.width().toFloat() / imgW
-                        val normH = face.boundingBox.height().toFloat() / imgH
-                        val normAspect = if (normH > 0f) normW / normH else 1f
-                        val headEulerY = (face.headEulerAngleY + 180f) / 360f
-                        val headEulerZ = (face.headEulerAngleZ + 180f) / 360f
-                        val vector = FloatArray(16) { idx ->
-                            when (idx) {
-                                0 -> normW
-                                1 -> normH
-                                2 -> normAspect
-                                3 -> headEulerY
-                                4 -> headEulerZ
-                                else -> enrolledTemplate.getOrElse(idx) { 0.5f }
+                        when (val extraction = FaceDescriptorExtractor.extractFromMlKitFace(faces[0])) {
+                            is DescriptorExtractionResult.Success -> {
+                                templateStore.computeCosineSimilarity(extraction.vector, enrolledTemplate)
                             }
+                            is DescriptorExtractionResult.Rejected -> 0f
                         }
-                        templateStore.computeCosineSimilarity(vector, enrolledTemplate)
                     } else {
                         0f
                     }
@@ -368,7 +453,6 @@ class MonitoringForegroundService : Service(), LifecycleOwner {
                     )
                 }
                 .addOnCompleteListener {
-                    // imageProxy.close() MUST be inside the detector's completion listener
                     imageProxy.close()
                 }
         } catch (e: Exception) {

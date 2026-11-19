@@ -9,22 +9,26 @@ import com.example.domain.model.DetectionMode
 import com.example.domain.model.DiagnosticEvent
 import com.example.domain.model.PresenceState
 import com.example.domain.model.ScreenTimeoutMode
+import com.example.domain.model.SyncSource
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * Global singleton bridge coordinating Foreground Service, NotificationListener,
- * and the Presentation Layer ViewModel.
+ * Adaptive Timing, and the Presentation Layer ViewModel.
  */
 object StayFrameServiceBridge {
 
-    val engine = PresenceStateEngine(
+    val engine: PresenceStateEngine = PresenceStateEngine(
         absenceGracePeriodSeconds = 5,
         detectionMode = DetectionMode.RELAXED_FALLBACK,
         callback = object : PresenceEngineCallback {
             override fun onStateChanged(newState: PresenceState, previousState: PresenceState) {
                 _presenceState.value = newState
+                _effectiveGraceSeconds.value = engine.effectiveGracePeriodSeconds
+                _activeSyncSource.value = engine.activeSyncSource
+                foregroundServiceInstance?.onPresenceStateChanged(newState, previousState)
             }
 
             override fun onSendPauseCommand(targetPackage: String, currentPositionMs: Long) {
@@ -70,6 +74,12 @@ object StayFrameServiceBridge {
     private val _remainingGraceSeconds = MutableStateFlow(5)
     val remainingGraceSeconds: StateFlow<Int> = _remainingGraceSeconds.asStateFlow()
 
+    private val _effectiveGraceSeconds = MutableStateFlow(5)
+    val effectiveGraceSeconds: StateFlow<Int> = _effectiveGraceSeconds.asStateFlow()
+
+    private val _activeSyncSource = MutableStateFlow(SyncSource.APP_GLOBAL_FALLBACK)
+    val activeSyncSource: StateFlow<SyncSource> = _activeSyncSource.asStateFlow()
+
     private val _sustainedPresenceProgress = MutableStateFlow(0f)
     val sustainedPresenceProgress: StateFlow<Float> = _sustainedPresenceProgress.asStateFlow()
 
@@ -87,6 +97,8 @@ object StayFrameServiceBridge {
             engine.stopMonitoring()
         }
         _presenceState.value = engine.currentState
+        _effectiveGraceSeconds.value = engine.effectiveGracePeriodSeconds
+        _remainingGraceSeconds.value = engine.getRemainingGraceSeconds()
     }
 
     fun setPreviewVisible(visible: Boolean) {
@@ -100,6 +112,10 @@ object StayFrameServiceBridge {
     fun updateActiveSession(info: ActiveMediaSessionInfo) {
         _activeSession.value = info
         engine.updateActiveMediaSession(info)
+        _presenceState.value = engine.currentState
+        _effectiveGraceSeconds.value = engine.effectiveGracePeriodSeconds
+        _activeSyncSource.value = engine.activeSyncSource
+        _remainingGraceSeconds.value = engine.getRemainingGraceSeconds()
     }
 
     fun onFaceObserved(observation: FaceObservation) {
@@ -113,7 +129,6 @@ object StayFrameServiceBridge {
     fun addDiagnosticEvent(event: DiagnosticEvent) {
         val current = _diagnosticEvents.value.toMutableList()
         current.add(0, event)
-        // Keep latest 100 entries (PRD Section 17)
         if (current.size > 100) {
             current.removeAt(current.lastIndex)
         }
