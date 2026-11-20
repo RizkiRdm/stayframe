@@ -12,7 +12,7 @@ StayFrame uses **GitHub Actions** for automated quality gates and production rel
 
 - **`.github/workflows/ci.yml`**:
   - Triggers on: Pull Requests & pushes to `main`.
-  - Runs: Dependency check, unit/Robolectric test suite (`:app:testDebugUnitTest`), and debug assembly.
+  - Runs: Debug keystore provisioning (decodes `debug.keystore.base64`), dependency check, unit/Robolectric test suite (`:app:testDebugUnitTest`), debug APK assembly (`./build_apk.sh debug`), and signed debug APK + checksum artifact upload.
 - **`.github/workflows/release.yml`**:
   - Triggers on: Tag pushes matching `v*.*.*` (e.g. `git tag v1.0.0 && git push origin v1.0.0`).
   - Decrypts the release keystore, builds the release APK (`:app:assembleRelease`) with R8 minification, computes SHA-256 checksums, generates `update-manifest.json`, and publishes a GitHub Release.

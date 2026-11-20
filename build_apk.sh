@@ -65,7 +65,42 @@ else
     echo "[✓] Dependency cache initialized successfully."
 fi
 
-# 4. Build the APK using Gradle
+# 4. Ensure Debug Keystore (for debug builds when gitignored binary is absent)
+if [ "$BUILD_TYPE" != "release" ]; then
+    echo ""
+    echo "[*] Checking Android debug keystore..."
+    if [ -f "debug.keystore" ]; then
+        echo "[✓] Existing debug.keystore found."
+    elif [ -f "debug.keystore.base64" ]; then
+        echo "[*] Decoding debug.keystore from debug.keystore.base64..."
+        if base64 --decode debug.keystore.base64 > debug.keystore 2>/dev/null; then
+            :
+        elif base64 -d debug.keystore.base64 > debug.keystore 2>/dev/null; then
+            :
+        else
+            base64 -D -i debug.keystore.base64 -o debug.keystore
+        fi
+        if [ ! -s "debug.keystore" ]; then
+            echo "[-] Error: Decoded debug.keystore is empty!"
+            rm -f debug.keystore
+            exit 1
+        fi
+        echo "[✓] Restored debug.keystore successfully."
+    else
+        echo "[!] debug.keystore.base64 not found; generating standard debug.keystore via keytool..."
+        if ! command -v keytool >/dev/null 2>&1; then
+            echo "[-] Error: 'keytool' not found and no debug.keystore available."
+            exit 1
+        fi
+        keytool -genkeypair -noprompt -keystore debug.keystore \
+            -storepass android -alias androiddebugkey -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+        echo "[✓] Generated fallback debug.keystore."
+    fi
+fi
+
+# 5. Build the APK using Gradle
 echo ""
 echo "[*] Compiling and assembling APK ($BUILD_TYPE mode)..."
 
@@ -85,7 +120,7 @@ if [ ! -f "$SOURCE_APK" ]; then
     exit 1
 fi
 
-# 5. Output Semantic Versioned APK
+# 6. Output Semantic Versioned APK
 mkdir -p "$OUTPUT_DIR"
 FINAL_APK_NAME="${APP_NAME}-v${VERSION}-${BUILD_TYPE}.apk"
 FINAL_APK_PATH="${OUTPUT_DIR}/${FINAL_APK_NAME}"

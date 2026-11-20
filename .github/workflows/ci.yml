@@ -30,14 +30,40 @@ jobs:
       - name: Grant Execute Permission to Build Scripts
         run: chmod +x build_apk.sh
 
+      - name: Provision Debug Keystore
+        run: |
+          if [ ! -f debug.keystore ]; then
+            if [ -f debug.keystore.base64 ]; then
+              echo "[*] Decoding repository debug.keystore.base64..."
+              base64 --decode debug.keystore.base64 > debug.keystore
+            else
+              echo "[!] debug.keystore.base64 missing; generating fallback debug.keystore..."
+              keytool -genkeypair -noprompt -keystore debug.keystore \
+                -storepass android -alias androiddebugkey -keypass android \
+                -keyalg RSA -keysize 2048 -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
+          else
+            echo "[✓] Existing debug.keystore found."
+          fi
+
       - name: Resolve and Cache Dependencies
         run: make install-deps
 
       - name: Run Unit & Robolectric Tests
         run: gradle --no-daemon :app:testDebugUnitTest
 
-      - name: Assemble Debug APK
-        run: gradle --no-daemon :app:assembleDebug
+      - name: Assemble Signed Debug APK
+        run: ./build_apk.sh debug
+
+      - name: Upload Signed Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stayframe-debug-apk
+          path: |
+            dist/StayFrame-*-debug.apk
+            dist/StayFrame-*-debug.apk.sha256
+          if-no-files-found: error
 
       - name: Upload Test Report Artifact
         if: failure()
