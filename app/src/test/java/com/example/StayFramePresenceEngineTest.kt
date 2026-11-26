@@ -10,9 +10,11 @@ import com.example.domain.model.DiagnosticEvent
 import com.example.domain.model.MediaPositionEstimator
 import com.example.domain.model.PlayerRegistry
 import com.example.domain.model.PresenceState
+import com.example.service.MonitoringForegroundService
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -25,24 +27,33 @@ class StayFramePresenceEngineTest {
     private var lastRewindTargetMs: Long? = null
     private var lastRewindOffsetMs: Long? = null
     private var lastPlayPackage: String? = null
+    private var pauseDispatchResult: Boolean = true
+    private var rewindDispatchResult: Boolean = true
+    private var playDispatchResult: Boolean = true
     private val loggedEvents = mutableListOf<DiagnosticEvent>()
 
     private val callback = object : PresenceEngineCallback {
         override fun onStateChanged(newState: PresenceState, previousState: PresenceState) {}
 
-        override fun onSendPauseCommand(targetPackage: String, currentPositionMs: Long) {
+        override fun onSendPauseCommand(targetPackage: String, currentPositionMs: Long): Boolean {
+            if (!pauseDispatchResult) return false
             lastPausePackage = targetPackage
             lastPausePosition = currentPositionMs
+            return true
         }
 
-        override fun onSendRewindCommand(targetPackage: String, targetPositionMs: Long, rewindOffsetMs: Long) {
+        override fun onSendRewindCommand(targetPackage: String, targetPositionMs: Long, rewindOffsetMs: Long): Boolean {
+            if (!rewindDispatchResult) return false
             lastRewindPackage = targetPackage
             lastRewindTargetMs = targetPositionMs
             lastRewindOffsetMs = rewindOffsetMs
+            return true
         }
 
-        override fun onSendPlayCommand(targetPackage: String) {
+        override fun onSendPlayCommand(targetPackage: String): Boolean {
+            if (!playDispatchResult) return false
             lastPlayPackage = targetPackage
+            return true
         }
 
         override fun onDiagnosticLog(event: DiagnosticEvent) {
@@ -60,6 +71,9 @@ class StayFramePresenceEngineTest {
         lastRewindTargetMs = null
         lastRewindOffsetMs = null
         lastPlayPackage = null
+        pauseDispatchResult = true
+        rewindDispatchResult = true
+        playDispatchResult = true
         loggedEvents.clear()
 
         engine = PresenceStateEngine(
@@ -341,6 +355,349 @@ class StayFramePresenceEngineTest {
             )
         )
         assertEquals(PresenceState.PRESENT, engine.currentState)
+    }
+
+    // =========================================================================
+    // T1 CAMERA RESILIENCE TESTS (ERROR -> RECOVER, WATCHDOG, BACKOFF)
+    // =========================================================================
+    @Test
+    fun testCameraResilience_ErrorToRecover_ExplicitHookRestoresPresent() {
+        engine.startMonitoring()
+        engine.updateActiveMediaSession(
+            ActiveMediaSessionInfo(
+                packageName = "com.google.android.youtube",
+                playerDisplayName = "YouTube",
+                isPlaying = true,
+                playbackPositionMs = 24000L,
+                isSupported = true
+            )
+        )
+        assertEquals(PresenceState.PRESENT, engine.currentState)
+
+        engine.reportError("Camera unavailable (attempt 3): CameraState CLOSED error code=1")
+        assertEquals(PresenceState.ERROR, engine.currentState)
+        assertTrue(engine.lastErrorMessage?.contains("Camera unavailable") == true)
+
+        engine.recoverFromError("CameraX hardware state OPEN")
+        assertEquals(PresenceState.PRESENT, engine.currentState)
+        assertNull(engine.lastErrorMessage)
+        assertTrue(loggedEvents.any { it.eventName == "camera_recovered" })
+    }
+
+    @Test
+    fun testCameraResilience_ErrorToRecover_PreservesIntentionalManualPause() {
+        engine.startMonitoring()
+        engine.updateActiveMediaSession(
+            ActiveMediaSessionInfo(
+                packageName = "org.videolan.vlc",
+                playerDisplayName = "VLC",
+                isPlaying = false,
+                playbackPositionMs = 15000L,
+                isSupported = true
+            )
+        )
+        assertEquals(PresenceState.PLAYER_DETECTED, engine.currentState)
+        assertTrue(engine.manualPauseDetected)
+
+        engine.reportError("Camera unavailable (attempt 3)")
+        assertEquals(PresenceState.ERROR, engine.currentState)
+
+        engine.recoverFromError("CameraX hardware state OPEN")
+        assertEquals(PresenceState.PLAYER_DETECTED, engine.currentState)
+        assertTrue(engine.manualPauseDetected)
+        assertNull(engine.lastErrorMessage)
+        assertNull(lastPlayPackage)
+    }
+
+    @Test
+    fun testCameraResilience_ErrorToRecover_IncomingObservationExitsError() {
+        engine.startMonitoring()
+        engine.updateActiveMediaSession(
+            ActiveMediaSessionInfo(
+                packageName = "com.google.android.youtube",
+                playerDisplayName = "YouTube",
+                isPlaying = true,
+                playbackPositionMs = 18000L,
+                isSupported = true
+            )
+        )
+
+        engine.reportError("Transient preemption")
+        assertEquals(PresenceState.ERROR, engine.currentState)
+
+        engine.processObservation(
+            FaceObservation(faceDetected = true, identityMatchConfidence = 0.90f, isEnrolledMatch = true),
+            currentTimeMs = 200000L
+        )
+        assertEquals(PresenceState.PRESENT, engine.currentState)
+        assertNull(engine.lastErrorMessage)
+        assertTrue(loggedEvents.any { it.eventName == "camera_recovered" })
+    }
+
+    @Test
+    fun testCameraResilience_WatchdogTimeout_EntersUnknownInRelaxedModeAndPausesOnExpiry() {
+        engine.setDetectionMode(DetectionMode.RELAXED_FALLBACK)
+        engine.startMonitoring()
+        engine.updateActiveMediaSession(
+            ActiveMediaSessionInfo(
+                packageName = "com.google.android.youtube",
+                playerDisplayName = "YouTube",
+                isPlaying = true,
+                playbackPositionMs = 30000L,
+                isSupported = true
+            )
+        )
+        assertEquals(PresenceState.PRESENT, engine.currentState)
+
+        val t0 = 100000L
+        engine.handleCameraWatchdogTimeout(t0, "No camera frames received for >5s")
+        assertEquals(PresenceState.UNKNOWN, engine.currentState)
+        assertTrue(loggedEvents.any { it.eventName == "camera_watchdog_timeout" })
+
+        engine.handleCameraWatchdogTimeout(t0 + 5000L, "Camera still stalled")
+        assertEquals(PresenceState.PAUSED_BY_GUARD, engine.currentState)
+        assertEquals("com.google.android.youtube", lastPausePackage)
+        assertEquals(25000L, lastRewindTargetMs)
+    }
+
+    @Test
+    fun testCameraResilience_BackoffExponentialAndCappedAt30SecondsWithNoRetryLimit() {
+        assertEquals(1_000L, MonitoringForegroundService.computeRebindBackoffMs(1))
+        assertEquals(2_000L, MonitoringForegroundService.computeRebindBackoffMs(2))
+        assertEquals(4_000L, MonitoringForegroundService.computeRebindBackoffMs(3))
+        assertEquals(8_000L, MonitoringForegroundService.computeRebindBackoffMs(4))
+        assertEquals(16_000L, MonitoringForegroundService.computeRebindBackoffMs(5))
+        assertEquals(30_000L, MonitoringForegroundService.computeRebindBackoffMs(6))
+        assertEquals(30_000L, MonitoringForegroundService.computeRebindBackoffMs(25))
+        assertEquals(30_000L, MonitoringForegroundService.computeRebindBackoffMs(500))
+    }
+
+    // =========================================================================
+    // T2 COMMAND DISPATCH SAFETY TESTS
+    // =========================================================================
+    @Test
+    fun testT2_PauseCommandFailure_WithholdsPausedByGuardAndOwnership() {
+        pauseDispatchResult = false
+        engine.startMonitoring()
+        engine.updateActiveMediaSession(
+            ActiveMediaSessionInfo(
+                packageName = "com.google.android.youtube",
+                playerDisplayName = "YouTube",
+                isPlaying = true,
+                playbackPositionMs = 30000L,
+                isSupported = true
+            )
+        )
+
+        val t0 = 100000L
+        engine.processObservation(FaceObservation(false, 0f, false), t0)
+        engine.processObservation(FaceObservation(false, 0f, false), t0 + 5000L)
+
+        assertNotEquals(PresenceState.PAUSED_BY_GUARD, engine.currentState)
+        assertFalse(engine.pauseOwnership)
+        assertNull(lastPausePackage)
+        assertNull(lastRewindPackage)
+        assertTrue(loggedEvents.any { it.eventName == "pause_dispatch_failed" })
+    }
+
+    @Test
+    fun testT2_PlayCommandFailure_KeepsPausedByGuardAndOwnership() {
+        engine.startMonitoring()
+        engine.updateActiveMediaSession(
+            ActiveMediaSessionInfo(
+                packageName = "org.videolan.vlc",
+                playerDisplayName = "VLC",
+                isPlaying = true,
+                playbackPositionMs = 20000L,
+                isSupported = true
+            )
+        )
+
+        val t0 = 100000L
+        engine.processObservation(FaceObservation(false, 0f, false), t0)
+        engine.processObservation(FaceObservation(false, 0f, false), t0 + 5100L)
+        assertEquals(PresenceState.PAUSED_BY_GUARD, engine.currentState)
+        assertTrue(engine.pauseOwnership)
+
+        playDispatchResult = false
+        val tReturn = t0 + 10000L
+        engine.processObservation(FaceObservation(true, 0.90f, true), tReturn)
+        engine.processObservation(FaceObservation(true, 0.90f, true), tReturn + 1100L)
+
+        assertEquals(PresenceState.PAUSED_BY_GUARD, engine.currentState)
+        assertTrue(engine.pauseOwnership)
+        assertNull(lastPlayPackage)
+        assertTrue(loggedEvents.any { it.eventName == "play_dispatch_failed" })
+
+        playDispatchResult = true
+        engine.processObservation(FaceObservation(true, 0.90f, true), tReturn + 2000L)
+        assertEquals(PresenceState.PRESENT, engine.currentState)
+        assertFalse(engine.pauseOwnership)
+        assertEquals("org.videolan.vlc", lastPlayPackage)
+    }
+
+    // =========================================================================
+    // T3 FAIL-CLOSED IDENTITY & LOW-LIGHT TESTS
+    // =========================================================================
+    @Test
+    fun testT3_StrictMode_UncertainIdentityOrMissingTemplate_EntersUnknownNotOtherFace() {
+        engine.setDetectionMode(DetectionMode.STRICT)
+        engine.startMonitoring()
+        engine.updateActiveMediaSession(
+            ActiveMediaSessionInfo(
+                packageName = "com.google.android.youtube",
+                playerDisplayName = "YouTube",
+                isPlaying = true,
+                playbackPositionMs = 25000L,
+                isSupported = true
+            )
+        )
+        assertEquals(PresenceState.PRESENT, engine.currentState)
+
+        val t0 = 100000L
+        engine.processObservation(
+            FaceObservation(
+                faceDetected = true,
+                identityMatchConfidence = 0f,
+                isEnrolledMatch = false,
+                lightingAdequate = true,
+                identityUncertain = true
+            ),
+            currentTimeMs = t0
+        )
+
+        assertEquals(PresenceState.UNKNOWN, engine.currentState)
+        assertNotEquals(PresenceState.OTHER_FACE, engine.currentState)
+
+        engine.processObservation(
+            FaceObservation(
+                faceDetected = true,
+                identityMatchConfidence = 0f,
+                isEnrolledMatch = false,
+                lightingAdequate = true,
+                identityUncertain = true
+            ),
+            currentTimeMs = t0 + 5000L
+        )
+        assertEquals(PresenceState.PAUSED_BY_GUARD, engine.currentState)
+        assertEquals("com.google.android.youtube", lastPausePackage)
+    }
+
+    @Test
+    fun testT3_LowLighting_TransitionsToUnknownEvenInRelaxedMode() {
+        engine.setDetectionMode(DetectionMode.RELAXED_FALLBACK)
+        engine.startMonitoring()
+        engine.updateActiveMediaSession(
+            ActiveMediaSessionInfo(
+                packageName = "com.google.android.youtube",
+                playerDisplayName = "YouTube",
+                isPlaying = true,
+                playbackPositionMs = 18000L,
+                isSupported = true
+            )
+        )
+        assertEquals(PresenceState.PRESENT, engine.currentState)
+
+        val t0 = 100000L
+        engine.processObservation(
+            FaceObservation(
+                faceDetected = false,
+                identityMatchConfidence = 0f,
+                isEnrolledMatch = false,
+                lightingAdequate = false,
+                identityUncertain = true
+            ),
+            currentTimeMs = t0
+        )
+        assertEquals(PresenceState.UNKNOWN, engine.currentState)
+
+        engine.processObservation(
+            FaceObservation(
+                faceDetected = false,
+                identityMatchConfidence = 0f,
+                isEnrolledMatch = false,
+                lightingAdequate = false,
+                identityUncertain = true
+            ),
+            currentTimeMs = t0 + 5000L
+        )
+        assertEquals(PresenceState.PAUSED_BY_GUARD, engine.currentState)
+        assertEquals("com.google.android.youtube", lastPausePackage)
+        assertEquals(13000L, lastRewindTargetMs)
+    }
+
+    // =========================================================================
+    // T4 BUFFERING & NON-MANUAL PAUSE TESTS
+    // =========================================================================
+    @Test
+    fun testT4_Buffering_NotTreatedAsManualPause_AllowsLaterAutoResume() {
+        engine.startMonitoring()
+        val playing = ActiveMediaSessionInfo(
+            packageName = "com.google.android.youtube",
+            playerDisplayName = "YouTube",
+            isPlaying = true,
+            isBuffering = false,
+            playbackPositionMs = 20000L,
+            isSupported = true
+        )
+        engine.updateActiveMediaSession(playing)
+        assertEquals(PresenceState.PRESENT, engine.currentState)
+
+        // Transition into STATE_BUFFERING / STATE_CONNECTING
+        engine.updateActiveMediaSession(playing.copy(isPlaying = false, isBuffering = true))
+        assertFalse(engine.manualPauseDetected)
+        assertEquals(PresenceState.PRESENT, engine.currentState)
+
+        // Resume active playback after buffering
+        engine.updateActiveMediaSession(playing.copy(isPlaying = true, isBuffering = false))
+        assertFalse(engine.manualPauseDetected)
+        assertEquals(PresenceState.PRESENT, engine.currentState)
+
+        // Now user leaves -> guard pauses -> user returns -> auto-resume must succeed
+        val t0 = 100000L
+        engine.processObservation(FaceObservation(false, 0f, false), t0)
+        engine.processObservation(FaceObservation(false, 0f, false), t0 + 5000L)
+        assertEquals(PresenceState.PAUSED_BY_GUARD, engine.currentState)
+
+        engine.processObservation(FaceObservation(true, 0.90f, true), t0 + 8000L)
+        engine.processObservation(FaceObservation(true, 0.90f, true), t0 + 9100L)
+        assertEquals(PresenceState.PRESENT, engine.currentState)
+        assertEquals("com.google.android.youtube", lastPlayPackage)
+    }
+
+    @Test
+    fun testT4_BufferingDuringAbsenceGrace_DoesNotResetTimers() {
+        engine.startMonitoring()
+        val playing = ActiveMediaSessionInfo(
+            packageName = "com.google.android.youtube",
+            playerDisplayName = "YouTube",
+            isPlaying = true,
+            isBuffering = false,
+            playbackPositionMs = 40000L,
+            isSupported = true
+        )
+        engine.updateActiveMediaSession(playing)
+
+        val t0 = 100000L
+        engine.processObservation(FaceObservation(false, 0f, false), t0)
+        assertEquals(PresenceState.ABSENCE_GRACE, engine.currentState)
+        assertEquals(5, engine.getRemainingGraceSeconds(t0))
+
+        // Mid-grace buffering occurs at t0 + 2500ms -> must NOT reset absence timer or flip to PLAYER_DETECTED
+        engine.updateActiveMediaSession(playing.copy(isPlaying = false, isBuffering = true))
+        assertEquals(PresenceState.ABSENCE_GRACE, engine.currentState)
+        assertFalse(engine.manualPauseDetected)
+        assertEquals(2, engine.getRemainingGraceSeconds(t0 + 3000L))
+
+        // Buffering finishes back to PLAYING at t0 + 3500ms -> timer STILL preserved
+        engine.updateActiveMediaSession(playing.copy(isPlaying = true, isBuffering = false))
+        assertEquals(PresenceState.ABSENCE_GRACE, engine.currentState)
+        assertEquals(1, engine.getRemainingGraceSeconds(t0 + 4000L))
+
+        // At t0 + 5000ms original grace expires -> auto-pauses cleanly
+        engine.processObservation(FaceObservation(false, 0f, false), t0 + 5000L)
+        assertEquals(PresenceState.PAUSED_BY_GUARD, engine.currentState)
+        assertEquals("com.google.android.youtube", lastPausePackage)
     }
 
     // =========================================================================

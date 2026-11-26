@@ -1,17 +1,25 @@
 package com.example
 
+import android.app.AlarmManager
 import android.content.Context
+import android.content.Intent
 import android.provider.Settings
 import androidx.test.core.app.ApplicationProvider
 import com.example.domain.controller.ScreenTimeoutController
 import com.example.domain.model.ScreenTimeoutMode
+import com.example.service.MonitoringForegroundService
+import com.example.service.ScreenTimeoutExpiryReceiver
+import com.example.service.StayFrameServiceBridge
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
@@ -73,5 +81,61 @@ class ScreenTimeoutControllerTest {
         controller.applyTimeout(ScreenTimeoutMode.OFF)
         assertFalse(controller.isOverrideActive())
         assertEquals(30000, controller.getCurrentSystemTimeout())
+    }
+
+    @Test
+    fun testT5_TimedMode_SchedulesAlarmManagerAndRestoreCancelsAlarm() {
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val shadowAlarm = Shadows.shadowOf(alarmManager)
+
+        assertTrue(controller.applyTimeout(ScreenTimeoutMode.MIN_15))
+        assertTrue(controller.isOverrideActive())
+        assertNotNull(shadowAlarm.peekNextScheduledAlarm())
+
+        assertTrue(controller.restoreTimeout())
+        assertFalse(controller.isOverrideActive())
+        assertTrue(shadowAlarm.scheduledAlarms.isEmpty())
+        assertEquals(30000, controller.getCurrentSystemTimeout())
+    }
+
+    @Test
+    fun testT5_ExpiryReceiverBroadcast_RestoresTimeoutAndResetsBridgeMode() {
+        StayFrameServiceBridge.setScreenTimeoutMode(ScreenTimeoutMode.MIN_30)
+        assertTrue(controller.applyTimeout(ScreenTimeoutMode.MIN_30))
+        assertEquals(30 * 60 * 1000, controller.getCurrentSystemTimeout())
+
+        ScreenTimeoutExpiryReceiver().onReceive(
+            context,
+            Intent(ScreenTimeoutController.ACTION_RESTORE_SCREEN_TIMEOUT)
+        )
+
+        assertFalse(controller.isOverrideActive())
+        assertEquals(30000, controller.getCurrentSystemTimeout())
+        assertEquals(ScreenTimeoutMode.OFF, StayFrameServiceBridge.screenTimeoutMode.value)
+    }
+
+    @Test
+    fun testT5_MonitoringServiceStopAndDestroy_RestoresTimeout() {
+        StayFrameServiceBridge.setScreenTimeoutMode(ScreenTimeoutMode.UNTIL_STOPPED)
+        assertTrue(controller.applyTimeout(ScreenTimeoutMode.UNTIL_STOPPED))
+        assertTrue(controller.isOverrideActive())
+
+        val stopIntent = Intent(context, MonitoringForegroundService::class.java)
+            .setAction(MonitoringForegroundService.ACTION_STOP)
+        val serviceStop = Robolectric.buildService(MonitoringForegroundService::class.java, stopIntent).create()
+        serviceStop.startCommand(0, 1)
+        assertFalse(controller.isOverrideActive())
+        assertEquals(30000, controller.getCurrentSystemTimeout())
+        assertEquals(ScreenTimeoutMode.OFF, StayFrameServiceBridge.screenTimeoutMode.value)
+
+        StayFrameServiceBridge.setScreenTimeoutMode(ScreenTimeoutMode.MIN_60)
+        assertTrue(controller.applyTimeout(ScreenTimeoutMode.MIN_60))
+        assertTrue(controller.isOverrideActive())
+
+        val serviceDestroy = Robolectric.buildService(MonitoringForegroundService::class.java).create()
+        serviceDestroy.destroy()
+        assertFalse(controller.isOverrideActive())
+        assertEquals(30000, controller.getCurrentSystemTimeout())
+        assertEquals(ScreenTimeoutMode.OFF, StayFrameServiceBridge.screenTimeoutMode.value)
     }
 }

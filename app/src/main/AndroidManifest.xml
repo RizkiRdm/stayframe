@@ -73,6 +73,11 @@
             </intent-filter>
         </service>
 
+        <!-- Alarm receiver for timed keep-screen-awake timeout restoration -->
+        <receiver
+            android:name=".service.ScreenTimeoutExpiryReceiver"
+            android:exported="false" />
+
     </application>
 
 </manifest>

@@ -1,5 +1,6 @@
 package com.example.domain.engine
 
+import com.example.domain.biometrics.FaceDescriptorExtractor
 import com.example.domain.model.AdaptiveIntervalResolver
 import com.example.domain.model.ActiveMediaSessionInfo
 import com.example.domain.model.DetectionMode
@@ -16,14 +17,15 @@ data class FaceObservation(
     val identityMatchConfidence: Float, // 0.0f to 1.0f
     val isEnrolledMatch: Boolean,
     val faceBoundingBox: List<Float>? = null, // [left, top, right, bottom] normalized
-    val lightingAdequate: Boolean = true
+    val lightingAdequate: Boolean = true,
+    val identityUncertain: Boolean = false
 )
 
 interface PresenceEngineCallback {
     fun onStateChanged(newState: PresenceState, previousState: PresenceState)
-    fun onSendPauseCommand(targetPackage: String, currentPositionMs: Long)
-    fun onSendRewindCommand(targetPackage: String, targetPositionMs: Long, rewindOffsetMs: Long)
-    fun onSendPlayCommand(targetPackage: String)
+    fun onSendPauseCommand(targetPackage: String, currentPositionMs: Long): Boolean
+    fun onSendRewindCommand(targetPackage: String, targetPositionMs: Long, rewindOffsetMs: Long): Boolean
+    fun onSendPlayCommand(targetPackage: String): Boolean
     fun onDiagnosticLog(event: DiagnosticEvent)
 }
 
@@ -78,7 +80,7 @@ class PresenceStateEngine(
     private var stablePresentStartTimeMs: Long = 0L
     private var sustainedPresenceStartTimeMs: Long = 0L
 
-    var matchThreshold: Float = 0.72f
+    var matchThreshold: Float = FaceDescriptorExtractor.RECOMMENDED_MATCH_THRESHOLD
 
     private val strictStableResumeDurationMs = 1000L
     private val relaxedSustainedPresenceDurationMs = 2000L
@@ -168,6 +170,10 @@ class PresenceStateEngine(
             )
         }
 
+        val inAbsenceCountdown = currentState == PresenceState.ABSENCE_GRACE ||
+            currentState == PresenceState.UNKNOWN ||
+            currentState == PresenceState.OTHER_FACE
+
         // Session package changed -> invalidate old ownership
         if (session.packageName != previous.packageName) {
             if (pauseOwnership && previous.packageName == ownedPackageName) {
@@ -175,12 +181,15 @@ class PresenceStateEngine(
                 ownedPackageName = null
                 logEvent("session_changed", "Package changed to ${session.packageName}; prior pause ownership cleared")
             }
-            // Reset manual pause flag if switching to a different player unless new session is already paused
-            manualPauseDetected = session.isSupported && !session.isPlaying
+            if (inAbsenceCountdown) {
+                resetTimers()
+            }
+            // Reset manual pause flag if switching to a different player unless new session is explicitly paused
+            manualPauseDetected = session.isSupported && !session.isPlaying && !session.isBuffering
         }
 
-        // Detect external manual pause while actively playing
-        if (!session.isPlaying && previous.isPlaying &&
+        // Detect external manual pause while actively playing (treat BUFFERING/CONNECTING as non-manual pause)
+        if (!session.isPlaying && !session.isBuffering && previous.isPlaying &&
             previous.packageName == session.packageName &&
             currentState != PresenceState.PAUSED_BY_GUARD
         ) {
@@ -191,12 +200,17 @@ class PresenceStateEngine(
             logEvent("manual_pause_detected", "User or external action paused playback. Auto-resume locked.")
         }
 
-        // Detect external play / resume
+        // Detect external play / resume (preserve timers if recovering from transient buffering during ABSENCE_GRACE)
         if (session.isPlaying && !previous.isPlaying) {
+            val resumedFromBuffering = previous.isBuffering && previous.packageName == session.packageName
             manualPauseDetected = false
-            pauseOwnership = false
-            ownedPackageName = null
-            resetTimers()
+            if (!resumedFromBuffering) {
+                pauseOwnership = false
+                ownedPackageName = null
+                if (!inAbsenceCountdown) {
+                    resetTimers()
+                }
+            }
             if (currentState == PresenceState.PAUSED_BY_GUARD ||
                 currentState == PresenceState.WAITING_FOR_PLAYER ||
                 currentState == PresenceState.PLAYER_DETECTED ||
@@ -222,14 +236,14 @@ class PresenceStateEngine(
                     transitionTo(targetState, "No active supported player in foreground")
                 }
             }
-        } else if (session.isSupported && !session.isPlaying) {
-            // Supported player detected but currently paused (do NOT auto-play)
+        } else if (session.isSupported && !session.isPlaying && !session.isBuffering) {
+            // Supported player detected but explicitly paused (do NOT auto-play)
             if (currentState != PresenceState.PAUSED_BY_GUARD) {
                 manualPauseDetected = true
                 resetTimers()
                 transitionTo(PresenceState.PLAYER_DETECTED, "Player detected paused; intentional pause preserved")
             }
-        } else if (session.isSupported && session.isPlaying) {
+        } else if (session.isSupported && (session.isPlaying || session.isBuffering)) {
             if (currentState == PresenceState.WAITING_FOR_PLAYER ||
                 currentState == PresenceState.PLAYER_DETECTED ||
                 currentState == PresenceState.PLAYER_IN_BACKGROUND ||
@@ -244,9 +258,12 @@ class PresenceStateEngine(
 
     fun processObservation(observation: FaceObservation, currentTimeMs: Long = System.currentTimeMillis()) = synchronized(lock) {
         if (currentState == PresenceState.INACTIVE ||
-            currentState == PresenceState.ERROR ||
             currentState == PresenceState.RECOVERING
         ) return
+
+        if (currentState == PresenceState.ERROR) {
+            recoverFromErrorLocked("Camera frame delivery resumed")
+        }
 
         if (!activeSession.isSupported || activeSession.packageName == null) {
             if (currentState != PresenceState.PAUSED_BY_GUARD) {
@@ -262,8 +279,28 @@ class PresenceStateEngine(
             }
         }
 
-        // If player is open/detected but paused intentionally (not by guard), never countdown or auto-play
-        if (currentState == PresenceState.PLAYER_DETECTED && !activeSession.isPlaying) {
+        // If player is open/detected but paused intentionally (not by guard or buffering), never countdown or auto-play
+        if (currentState == PresenceState.PLAYER_DETECTED && !activeSession.isPlaying && !activeSession.isBuffering) {
+            return
+        }
+
+        // Fail-closed T3: Insufficient lighting or covered lens routes to UNKNOWN
+        if (!observation.lightingAdequate) {
+            handleUnknownOrObstructedLocked(
+                currentTimeMs = currentTimeMs,
+                reason = "Insufficient lighting or covered camera lens",
+                forceEvenInRelaxed = true
+            )
+            return
+        }
+
+        // Fail-closed T3: Strict Mode missing template or rejected landmarks -> UNKNOWN (not mismatch)
+        if (detectionMode == DetectionMode.STRICT && observation.faceDetected && observation.identityUncertain) {
+            handleUnknownOrObstructedLocked(
+                currentTimeMs = currentTimeMs,
+                reason = "Uncertain biometric verification (missing template or low-quality landmarks)",
+                forceEvenInRelaxed = true
+            )
             return
         }
 
@@ -300,7 +337,7 @@ class PresenceStateEngine(
     private fun triggerAutoPauseAndRewind() {
         val targetPackage = activeSession.packageName
 
-        if (targetPackage == null || !activeSession.isSupported || !activeSession.isPlaying) {
+        if (targetPackage == null || !activeSession.isSupported || (!activeSession.isPlaying && !activeSession.isBuffering)) {
             pauseOwnership = false
             ownedPackageName = null
             logEvent("skip_auto_pause", "Player is not playing (isPlaying=${activeSession.isPlaying}); skipping pause and ownership")
@@ -311,22 +348,32 @@ class PresenceStateEngine(
         val rewindOffsetMs = if (activeSession.canSeek) effectiveGracePeriodSeconds * 1000L else 0L
         val targetPositionMs = max(0L, currentPos - rewindOffsetMs)
 
-        callback?.onSendPauseCommand(targetPackage, currentPos)
+        val pauseDispatched = callback?.onSendPauseCommand(targetPackage, currentPos) ?: false
+        if (!pauseDispatched) {
+            pauseOwnership = false
+            ownedPackageName = null
+            logEvent("pause_dispatch_failed", "Failed to dispatch pause command to $targetPackage; PAUSED_BY_GUARD withheld")
+            return
+        }
 
+        var rewindDispatched = false
         if (rewindOffsetMs > 0L) {
-            callback?.onSendRewindCommand(targetPackage, targetPositionMs, rewindOffsetMs)
+            rewindDispatched = callback?.onSendRewindCommand(targetPackage, targetPositionMs, rewindOffsetMs) ?: false
         }
 
         pauseOwnership = true
         ownedPackageName = targetPackage
         manualPauseDetected = false
 
-        val detailMsg = if (rewindOffsetMs > 0L) {
-            "Paused $targetPackage and rewound -${effectiveGracePeriodSeconds}s (${activeSyncSource.label}) to $targetPositionMs ms"
-        } else {
-            "Paused $targetPackage (seek unsupported on live/ad stream)"
+        val detailMsg = when {
+            rewindOffsetMs > 0L && rewindDispatched ->
+                "Paused $targetPackage and rewound -${effectiveGracePeriodSeconds}s (${activeSyncSource.label}) to $targetPositionMs ms"
+            rewindOffsetMs > 0L ->
+                "Paused $targetPackage (rewind command did not confirm)"
+            else ->
+                "Paused $targetPackage (seek unsupported on live/ad stream)"
         }
-        logEvent("auto_pause_and_rewind", detailMsg, rewindOffsetMs)
+        logEvent("auto_pause_and_rewind", detailMsg, if (rewindDispatched) rewindOffsetMs else 0L)
 
         transitionTo(PresenceState.PAUSED_BY_GUARD, "Absence grace expired; playback guarded")
     }
@@ -356,6 +403,16 @@ class PresenceStateEngine(
                 absenceStartTimeMs = currentTimeMs
                 transitionTo(PresenceState.OTHER_FACE, "Detected face does not match enrolled viewer; grace started")
                 logEvent("unrecognized_face_absent", "Non-matching face in strict mode; starting ${effectiveGracePeriodSeconds}s countdown")
+            }
+            PresenceState.UNKNOWN -> {
+                if (absenceStartTimeMs == 0L) {
+                    absenceStartTimeMs = currentTimeMs
+                }
+                transitionTo(PresenceState.OTHER_FACE, "Detected face does not match enrolled viewer")
+                val elapsedMs = currentTimeMs - absenceStartTimeMs
+                if (elapsedMs >= effectiveGracePeriodSeconds * 1000L) {
+                    triggerAutoPauseAndRewind()
+                }
             }
             PresenceState.OTHER_FACE, PresenceState.ABSENCE_GRACE -> {
                 val elapsedMs = currentTimeMs - absenceStartTimeMs
@@ -421,7 +478,11 @@ class PresenceStateEngine(
     private fun triggerAutoResume() {
         val targetPackage = activeSession.packageName
         if (pauseOwnership && !manualPauseDetected && targetPackage != null && targetPackage == ownedPackageName) {
-            callback?.onSendPlayCommand(targetPackage)
+            val playDispatched = callback?.onSendPlayCommand(targetPackage) ?: false
+            if (!playDispatched) {
+                logEvent("play_dispatch_failed", "Failed to dispatch play command to $targetPackage; staying PAUSED_BY_GUARD")
+                return
+            }
             pauseOwnership = false
             ownedPackageName = null
             logEvent("auto_resume_sent", "Resuming playback on $targetPackage")
@@ -431,16 +492,80 @@ class PresenceStateEngine(
     }
 
     fun handleUnknownOrObstructed(currentTimeMs: Long, reason: String) = synchronized(lock) {
-        if (detectionMode == DetectionMode.RELAXED_FALLBACK) {
+        handleUnknownOrObstructedLocked(currentTimeMs, reason, forceEvenInRelaxed = false)
+    }
+
+    private fun handleUnknownOrObstructedLocked(
+        currentTimeMs: Long,
+        reason: String,
+        forceEvenInRelaxed: Boolean
+    ) {
+        if (!forceEvenInRelaxed && detectionMode == DetectionMode.RELAXED_FALLBACK) {
             return
         }
+        if (currentState == PresenceState.INACTIVE ||
+            currentState == PresenceState.ERROR ||
+            currentState == PresenceState.RECOVERING ||
+            currentState == PresenceState.PAUSED_BY_GUARD ||
+            currentState == PresenceState.PLAYER_DETECTED ||
+            currentState == PresenceState.PLAYER_IN_BACKGROUND ||
+            currentState == PresenceState.PLAYER_UNAVAILABLE ||
+            currentState == PresenceState.WAITING_FOR_PLAYER
+        ) {
+            return
+        }
+
         stablePresentStartTimeMs = 0L
         sustainedPresenceStartTimeMs = 0L
 
-        if (currentState == PresenceState.PRESENT) {
-            absenceStartTimeMs = currentTimeMs
+        if (currentState == PresenceState.PRESENT ||
+            currentState == PresenceState.ABSENCE_GRACE ||
+            currentState == PresenceState.OTHER_FACE
+        ) {
+            if (absenceStartTimeMs == 0L) {
+                absenceStartTimeMs = currentTimeMs
+            }
             transitionTo(PresenceState.UNKNOWN, reason)
-        } else if (currentState == PresenceState.UNKNOWN || currentState == PresenceState.ABSENCE_GRACE) {
+            logEvent("unknown_or_obstructed", reason)
+        } else if (currentState == PresenceState.UNKNOWN) {
+            val elapsedMs = currentTimeMs - absenceStartTimeMs
+            if (elapsedMs >= (effectiveGracePeriodSeconds * 1000L)) {
+                triggerAutoPauseAndRewind()
+            }
+        }
+    }
+
+    fun handleCameraWatchdogTimeout(
+        currentTimeMs: Long = System.currentTimeMillis(),
+        reason: String = "No camera frames received for >5s"
+    ) = synchronized(lock) {
+        if (currentState == PresenceState.INACTIVE ||
+            currentState == PresenceState.ERROR ||
+            currentState == PresenceState.RECOVERING ||
+            currentState == PresenceState.PAUSED_BY_GUARD ||
+            currentState == PresenceState.PLAYER_DETECTED ||
+            currentState == PresenceState.PLAYER_IN_BACKGROUND ||
+            currentState == PresenceState.PLAYER_UNAVAILABLE ||
+            currentState == PresenceState.WAITING_FOR_PLAYER
+        ) {
+            return
+        }
+
+        stablePresentStartTimeMs = 0L
+        sustainedPresenceStartTimeMs = 0L
+
+        if (!activeSession.isSupported || activeSession.packageName == null) {
+            return
+        }
+
+        if (absenceStartTimeMs == 0L) {
+            absenceStartTimeMs = currentTimeMs
+        }
+
+        if (currentState != PresenceState.UNKNOWN) {
+            transitionTo(PresenceState.UNKNOWN, reason)
+            logEvent("camera_watchdog_timeout", reason)
+        } else {
             val elapsedMs = currentTimeMs - absenceStartTimeMs
             if (elapsedMs >= (effectiveGracePeriodSeconds * 1000L)) {
                 triggerAutoPauseAndRewind()
@@ -451,11 +576,16 @@ class PresenceStateEngine(
     fun userRequestResume() = synchronized(lock) {
         val targetPackage = activeSession.packageName
         if (targetPackage != null && activeSession.isSupported) {
-            callback?.onSendPlayCommand(targetPackage)
-            pauseOwnership = false
-            manualPauseDetected = false
-            transitionTo(PresenceState.PRESENT, "User manually triggered Play")
-            logEvent("manual_play_triggered", "Play sent to $targetPackage")
+            val playDispatched = callback?.onSendPlayCommand(targetPackage) ?: false
+            if (playDispatched) {
+                pauseOwnership = false
+                ownedPackageName = null
+                manualPauseDetected = false
+                transitionTo(PresenceState.PRESENT, "User manually triggered Play")
+                logEvent("manual_play_triggered", "Play sent to $targetPackage")
+            } else {
+                logEvent("play_dispatch_failed", "Manual play failed for $targetPackage")
+            }
         }
     }
 
@@ -463,6 +593,25 @@ class PresenceStateEngine(
         lastErrorMessage = errorMessage
         transitionTo(PresenceState.ERROR, errorMessage)
         logEvent("engine_error", errorMessage)
+    }
+
+    fun recoverFromError(reason: String = "Camera hardware recovered") = synchronized(lock) {
+        if (currentState == PresenceState.ERROR) {
+            recoverFromErrorLocked(reason)
+        }
+    }
+
+    private fun recoverFromErrorLocked(reason: String) {
+        lastErrorMessage = null
+        resetTimers()
+        recomputeEffectiveTimingLocked()
+        val resolvedState = resolveStateForSessionLocked(activeSession)
+        if (resolvedState == PresenceState.PLAYER_DETECTED) {
+            pauseOwnership = false
+            ownedPackageName = null
+        }
+        transitionTo(resolvedState, reason)
+        logEvent("camera_recovered", "$reason -> ${resolvedState.title}")
     }
 
     private fun recomputeEffectiveTimingLocked() {
@@ -481,7 +630,7 @@ class PresenceStateEngine(
 
     private fun resolveStateForSessionLocked(session: ActiveMediaSessionInfo): PresenceState {
         return when {
-            session.isSupported && session.isPlaying -> PresenceState.PRESENT
+            session.isSupported && (session.isPlaying || session.isBuffering) -> PresenceState.PRESENT
             session.isSupported && !session.isPlaying -> PresenceState.PLAYER_DETECTED
             lastObservedPlayerPackage != null -> PresenceState.PLAYER_IN_BACKGROUND
             else -> PresenceState.WAITING_FOR_PLAYER

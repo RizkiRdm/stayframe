@@ -109,6 +109,7 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
     override fun onListenerConnected() {
         super.onListenerConnected()
         StayFrameServiceBridge.listenerServiceInstance = this
+        StayFrameServiceBridge.reportListenerReconnected()
 
         registerPackageObserver()
         PlayerRescanWorker.schedulePeriodicRescan(applicationContext)
@@ -126,6 +127,23 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
         StayFrameServiceBridge.listenerServiceInstance = null
         unregisterPackageObserver()
         clearCallbacks()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            val comp = componentName ?: ComponentName(this, StayFrameNotificationListenerService::class.java)
+            try {
+                requestRebind(comp)
+            } catch (e: Exception) {
+                StayFrameServiceBridge.recordRecoverableException(
+                    "listener_rebind_failed",
+                    "Failed to request NotificationListener rebind",
+                    e
+                )
+            }
+        }
+        if (StayFrameServiceBridge.isMonitoring.value) {
+            StayFrameServiceBridge.reportListenerDisconnectedError(
+                "Notification Listener disconnected; attempting rebind. Check Notification Access if playback control fails."
+            )
+        }
     }
 
     override fun onDestroy() {
@@ -142,7 +160,13 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
         for (controller in registeredControllers.values) {
             try {
                 controller.unregisterCallback(sessionCallback)
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                StayFrameServiceBridge.recordRecoverableException(
+                    "media_callback_unregister_failed",
+                    "Failed to unregister stale MediaController callback",
+                    e
+                )
+            }
         }
         registeredControllers.clear()
     }
@@ -170,12 +194,18 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
         if (!isReceiverRegistered) return
         try {
             packageChangeReceiver?.let { applicationContext.unregisterReceiver(it) }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            StayFrameServiceBridge.recordRecoverableException(
+                "package_receiver_unregister_failed",
+                "Failed to unregister PackageChangeReceiver",
+                e
+            )
+        }
         packageChangeReceiver = null
         isReceiverRegistered = false
     }
 
-    private suspend fun attemptArmedSessionRecovery() {
+    internal suspend fun attemptArmedSessionRecovery() {
         val prefs = preferencesRepository.getSnapshot()
         StayFrameServiceBridge.engine.setAbsenceGracePeriod(prefs.gracePeriodSeconds)
         StayFrameServiceBridge.engine.setDetectionMode(prefs.detectionMode)
@@ -192,31 +222,18 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
             return
         }
 
-        StayFrameServiceBridge.engine.beginRecovery()
-
-        try {
-            MonitoringForegroundService.start(applicationContext)
-            StayFrameServiceBridge.addDiagnosticEvent(
-                DiagnosticEvent(
-                    state = StayFrameServiceBridge.presenceState.value,
-                    eventName = "recovery_resumed",
-                    details = "Monitoring service resumed after OS reconnection"
-                )
+        // T7: Never launch a camera FGS automatically from background; post tap-to-resume notification instead.
+        StayFrameServiceBridge.addDiagnosticEvent(
+            DiagnosticEvent(
+                state = StayFrameServiceBridge.presenceState.value,
+                eventName = "recovery_tap_to_resume_posted",
+                details = "Armed monitoring session interrupted; posted tap-to-resume notification for user launch."
             )
-        } catch (e: Exception) {
-            // Android 14+ prohibits launching camera foreground service from pure background
-            StayFrameServiceBridge.addDiagnosticEvent(
-                DiagnosticEvent(
-                    state = StayFrameServiceBridge.presenceState.value,
-                    eventName = "recovery_requires_foreground_tap",
-                    details = "System blocked background camera start; tap recovery notification to resume."
-                )
-            )
-            postRecoveryNotification()
-        }
+        )
+        postRecoveryNotification()
     }
 
-    private fun postRecoveryNotification() {
+    internal fun postRecoveryNotification() {
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
@@ -228,7 +245,10 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
         }
 
         val resumeIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(MainActivity.EXTRA_RESUME_MONITORING, true)
         }
         val pending = PendingIntent.getActivity(
             this,
@@ -240,7 +260,7 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
         val notification = NotificationCompat.Builder(this, RECOVERY_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle("StayFrame Guard Interrupted")
-            .setContentText("Tap to restore camera presence monitoring.")
+            .setContentText("Tap to resume camera presence monitoring.")
             .setAutoCancel(true)
             .setContentIntent(pending)
             .build()
@@ -272,7 +292,13 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
                 if (entry.key !in currentTokens) {
                     try {
                         entry.value.unregisterCallback(sessionCallback)
-                    } catch (_: Exception) {}
+                    } catch (e: Exception) {
+                        StayFrameServiceBridge.recordRecoverableException(
+                            "media_callback_unregister_failed",
+                            "Failed to unregister inactive MediaController callback",
+                            e
+                        )
+                    }
                     iterator.remove()
                 }
             }
@@ -283,7 +309,13 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
                     try {
                         controller.registerCallback(sessionCallback, mainHandler)
                         registeredControllers[token] = controller
-                    } catch (_: Exception) {}
+                    } catch (e: Exception) {
+                        StayFrameServiceBridge.recordRecoverableException(
+                            "media_callback_register_failed",
+                            "Failed to register MediaController callback for ${controller.packageName}",
+                            e
+                        )
+                    }
                 }
             }
 
@@ -325,11 +357,14 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
                     adapterRequiresSeekTo = builtIn?.supportsSeek ?: true
                 )
 
-                val isPlaying = playbackState?.state == PlaybackState.STATE_PLAYING
+                val pbState = playbackState?.state
+                val isPlaying = pbState == PlaybackState.STATE_PLAYING
+                val isBuffering = pbState == PlaybackState.STATE_BUFFERING ||
+                    pbState == PlaybackState.STATE_CONNECTING
                 val basePosition = playbackState?.position ?: 0L
                 val lastUpdateTime = playbackState?.lastPositionUpdateTime ?: 0L
                 val position = MediaPositionEstimator.estimatePosition(
-                    state = playbackState?.state,
+                    state = pbState,
                     basePosition = basePosition,
                     lastPositionUpdateTime = lastUpdateTime,
                     playbackSpeed = capabilities.playbackSpeed
@@ -339,6 +374,7 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
                     packageName = pkg,
                     playerDisplayName = registryEntry?.displayName ?: builtIn?.displayName ?: pkg,
                     isPlaying = isPlaying,
+                    isBuffering = isBuffering,
                     playbackPositionMs = position,
                     isSupported = isSupported,
                     canSeek = timing.canSeek,
@@ -350,6 +386,8 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
                 if (isSupported && isPlaying) {
                     bestSession = sessionInfo
                     break
+                } else if (isSupported && isBuffering && (bestSession == null || (!bestSession.isPlaying && !bestSession.isBuffering))) {
+                    bestSession = sessionInfo
                 } else if (isSupported && bestSession == null) {
                     bestSession = sessionInfo
                 }
@@ -359,6 +397,7 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
                 packageName = null,
                 playerDisplayName = "No Active Player",
                 isPlaying = false,
+                isBuffering = false,
                 playbackPositionMs = 0L,
                 isSupported = false
             )
@@ -366,29 +405,80 @@ class StayFrameNotificationListenerService : NotificationListenerService() {
             mainHandler.post {
                 StayFrameServiceBridge.updateActiveSession(finalSession)
             }
-        } catch (_: SecurityException) {
-            // Permission might not be granted yet
-        } catch (_: Exception) {}
+        } catch (e: SecurityException) {
+            StayFrameServiceBridge.recordRecoverableException(
+                "media_session_security_error",
+                "Notification Listener access missing while querying active sessions",
+                e
+            )
+        } catch (e: Exception) {
+            StayFrameServiceBridge.recordRecoverableException(
+                "media_session_refresh_failed",
+                "Failed to refresh active media sessions",
+                e
+            )
+        }
     }
 
-    fun sendPauseCommand(targetPackage: String) {
-        val controller = activeControllers.find { it.packageName == targetPackage }
-            ?: sessionManager?.getActiveSessions(componentName ?: return)?.find { it.packageName == targetPackage }
-
-        controller?.transportControls?.pause()
+    private fun resolveController(targetPackage: String): MediaController? {
+        return activeControllers.find { it.packageName == targetPackage }
+            ?: run {
+                val comp = componentName ?: return null
+                try {
+                    sessionManager?.getActiveSessions(comp)?.find { it.packageName == targetPackage }
+                } catch (e: Exception) {
+                    StayFrameServiceBridge.recordRecoverableException(
+                        "media_controller_resolve_failed",
+                        "Failed to resolve MediaController for $targetPackage",
+                        e
+                    )
+                    null
+                }
+            }
     }
 
-    fun sendRewindCommand(targetPackage: String, targetPositionMs: Long) {
-        val controller = activeControllers.find { it.packageName == targetPackage }
-            ?: sessionManager?.getActiveSessions(componentName ?: return)?.find { it.packageName == targetPackage }
-
-        controller?.transportControls?.seekTo(targetPositionMs)
+    fun sendPauseCommand(targetPackage: String): Boolean {
+        val controller = resolveController(targetPackage) ?: return false
+        return try {
+            controller.transportControls.pause()
+            true
+        } catch (e: Exception) {
+            StayFrameServiceBridge.recordRecoverableException(
+                "media_pause_command_failed",
+                "Transport pause command failed for $targetPackage",
+                e
+            )
+            false
+        }
     }
 
-    fun sendPlayCommand(targetPackage: String) {
-        val controller = activeControllers.find { it.packageName == targetPackage }
-            ?: sessionManager?.getActiveSessions(componentName ?: return)?.find { it.packageName == targetPackage }
+    fun sendRewindCommand(targetPackage: String, targetPositionMs: Long): Boolean {
+        val controller = resolveController(targetPackage) ?: return false
+        return try {
+            controller.transportControls.seekTo(targetPositionMs)
+            true
+        } catch (e: Exception) {
+            StayFrameServiceBridge.recordRecoverableException(
+                "media_rewind_command_failed",
+                "Transport seekTo($targetPositionMs) failed for $targetPackage",
+                e
+            )
+            false
+        }
+    }
 
-        controller?.transportControls?.play()
+    fun sendPlayCommand(targetPackage: String): Boolean {
+        val controller = resolveController(targetPackage) ?: return false
+        return try {
+            controller.transportControls.play()
+            true
+        } catch (e: Exception) {
+            StayFrameServiceBridge.recordRecoverableException(
+                "media_play_command_failed",
+                "Transport play command failed for $targetPackage",
+                e
+            )
+            false
+        }
     }
 }

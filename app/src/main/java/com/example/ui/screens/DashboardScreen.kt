@@ -90,6 +90,8 @@ fun DashboardScreen(
 
     val cameraPermissionGranted by viewModel.cameraPermissionGranted.collectAsState()
     val notificationListenerGranted by viewModel.notificationListenerGranted.collectAsState()
+    val listenerConnected by viewModel.listenerConnected.collectAsState()
+    val lastErrorMessage by viewModel.lastErrorMessage.collectAsState()
 
     Box(
         modifier = modifier
@@ -185,6 +187,50 @@ fun DashboardScreen(
                 }
             }
 
+            if (isMonitoring && !listenerConnected) {
+                item {
+                    SleeveCard(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("listener_disconnected_error_card"),
+                        backgroundColor = MaterialTheme.colorScheme.surfaceVariant,
+                        borderColor = StatusRed
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = "Notification listener error",
+                                tint = StatusRed,
+                                modifier = Modifier.size(24.dp)
+                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Media Listener Disconnected",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = StatusRed
+                                )
+                                Text(
+                                    text = lastErrorMessage
+                                        ?: "Notification Listener service is unbound. Playback pause/resume commands cannot be dispatched until reconnected.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(12.dp))
+                        SleevePillButton(
+                            text = "Check Notification Access",
+                            onClick = onNavigateToSettings,
+                            isPrimary = false,
+                            modifier = Modifier.fillMaxWidth(),
+                            testTag = "listener_error_settings_button"
+                        )
+                    }
+                }
+            }
+
             // Main Status Hero Card
             item {
                 SleeveCard(
@@ -247,7 +293,7 @@ fun DashboardScreen(
 
                     Text(
                         text = if (presenceState == PresenceState.ERROR) {
-                            viewModel.presenceEngineLastErrorMessage ?: presenceState.description
+                            lastErrorMessage ?: viewModel.presenceEngineLastErrorMessage ?: presenceState.description
                         } else {
                             presenceState.description
                         },

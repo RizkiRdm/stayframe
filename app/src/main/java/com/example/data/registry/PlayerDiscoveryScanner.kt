@@ -10,6 +10,7 @@ import android.os.Build
 import com.example.domain.model.DiscoverySource
 import com.example.domain.model.PlayerRegistry
 import com.example.domain.model.PlayerVerificationStatus
+import com.example.service.StayFrameServiceBridge
 
 /**
  * Multi-signal video player discovery scanner compliant with Android 11+ <queries>.
@@ -160,8 +161,14 @@ class PlayerDiscoveryScanner(private val context: Context) {
                 pm.getPackageInfo(packageName, 0)
             }
         } catch (_: PackageManager.NameNotFoundException) {
+            // Expected when a known third-party player package is not installed on the device.
             null
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            StayFrameServiceBridge.recordRecoverableException(
+                "player_package_info_failed",
+                "Unexpected PackageManager failure inspecting $packageName",
+                e
+            )
             null
         }
     }
@@ -175,7 +182,12 @@ class PlayerDiscoveryScanner(private val context: Context) {
                 pm.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
             }
             resolved.mapNotNull { it.activityInfo?.packageName }.toSet()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            StayFrameServiceBridge.recordRecoverableException(
+                "player_intent_query_failed",
+                "Failed querying video intent handlers",
+                e
+            )
             emptySet()
         }
     }
@@ -190,7 +202,12 @@ class PlayerDiscoveryScanner(private val context: Context) {
                 pm.queryIntentServices(intent, 0)
             }
             resolved.mapNotNull { it.serviceInfo?.packageName }.toSet()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            StayFrameServiceBridge.recordRecoverableException(
+                "player_service_query_failed",
+                "Failed querying media services for $action",
+                e
+            )
             emptySet()
         }
     }
@@ -205,7 +222,12 @@ class PlayerDiscoveryScanner(private val context: Context) {
                 pm.queryBroadcastReceivers(intent, 0)
             }
             resolved.mapNotNull { it.activityInfo?.packageName }.toSet()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            StayFrameServiceBridge.recordRecoverableException(
+                "player_receiver_query_failed",
+                "Failed querying media receivers for $action",
+                e
+            )
             emptySet()
         }
     }

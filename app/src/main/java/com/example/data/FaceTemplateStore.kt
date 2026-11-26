@@ -3,6 +3,8 @@ package com.example.data
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Base64
+import com.example.domain.biometrics.FaceDescriptorExtractor
+import com.example.service.StayFrameServiceBridge
 import java.nio.ByteBuffer
 import java.security.KeyStore
 import javax.crypto.Cipher
@@ -15,7 +17,78 @@ import kotlin.math.sqrt
  * On-device face template encryption and storage backed by Android Keystore.
  * Stores only normalized feature vectors; never stores raw camera frames or images.
  */
-class FaceTemplateStore(private val context: Context) {
+class FaceTemplateStore internal constructor(
+    private val context: Context,
+    private val keyStoreDelegate: KeyStoreDelegate = AndroidKeyStoreDelegate
+) {
+
+    constructor(context: Context) : this(context, AndroidKeyStoreDelegate)
+
+    internal interface KeyStoreDelegate {
+        fun ensureKey(alias: String)
+        fun getKey(alias: String): SecretKey?
+        fun deleteKey(alias: String)
+    }
+
+    private object AndroidKeyStoreDelegate : KeyStoreDelegate {
+        override fun ensureKey(alias: String) {
+            try {
+                val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+                if (!keyStore.containsAlias(alias)) {
+                    val keyGen = KeyGenerator.getInstance(
+                        android.security.keystore.KeyProperties.KEY_ALGORITHM_AES,
+                        ANDROID_KEYSTORE
+                    )
+                    val keyGenParameterSpec = android.security.keystore.KeyGenParameterSpec.Builder(
+                        alias,
+                        android.security.keystore.KeyProperties.PURPOSE_ENCRYPT or android.security.keystore.KeyProperties.PURPOSE_DECRYPT
+                    )
+                        .setBlockModes(android.security.keystore.KeyProperties.BLOCK_MODE_GCM)
+                        .setEncryptionPaddings(android.security.keystore.KeyProperties.ENCRYPTION_PADDING_NONE)
+                        .setKeySize(256)
+                        .build()
+
+                    keyGen.init(keyGenParameterSpec)
+                    keyGen.generateKey()
+                }
+            } catch (e: Exception) {
+                StayFrameServiceBridge.recordRecoverableException(
+                    "keystore_ensure_failed",
+                    "Failed to initialize Keystore key for $alias",
+                    e
+                )
+            }
+        }
+
+        override fun getKey(alias: String): SecretKey? {
+            return try {
+                val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+                (keyStore.getEntry(alias, null) as? KeyStore.SecretKeyEntry)?.secretKey
+            } catch (e: Exception) {
+                StayFrameServiceBridge.recordRecoverableException(
+                    "keystore_load_failed",
+                    "Failed to retrieve Keystore key for $alias",
+                    e
+                )
+                null
+            }
+        }
+
+        override fun deleteKey(alias: String) {
+            try {
+                val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+                if (keyStore.containsAlias(alias)) {
+                    keyStore.deleteEntry(alias)
+                }
+            } catch (e: Exception) {
+                StayFrameServiceBridge.recordRecoverableException(
+                    "keystore_delete_failed",
+                    "Failed to delete Keystore key for $alias",
+                    e
+                )
+            }
+        }
+    }
 
     private val prefs: SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -31,8 +104,8 @@ class FaceTemplateStore(private val context: Context) {
         private const val TRANSFORMATION = "AES/GCM/NoPadding"
         private const val GCM_TAG_LENGTH = 128
 
-        /** Default cosine similarity threshold for identity match */
-        const val MATCH_THRESHOLD = 0.72f
+        /** Canonical cosine similarity threshold for identity match */
+        const val MATCH_THRESHOLD = FaceDescriptorExtractor.RECOMMENDED_MATCH_THRESHOLD
     }
 
     init {
@@ -40,45 +113,21 @@ class FaceTemplateStore(private val context: Context) {
     }
 
     private fun ensureKeyStoreKey() {
-        try {
-            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-            if (!keyStore.containsAlias(KEY_ALIAS)) {
-                val keyGen = KeyGenerator.getInstance(
-                    android.security.keystore.KeyProperties.KEY_ALGORITHM_AES,
-                    ANDROID_KEYSTORE
-                )
-                val keyGenParameterSpec = android.security.keystore.KeyGenParameterSpec.Builder(
-                    KEY_ALIAS,
-                    android.security.keystore.KeyProperties.PURPOSE_ENCRYPT or android.security.keystore.KeyProperties.PURPOSE_DECRYPT
-                )
-                    .setBlockModes(android.security.keystore.KeyProperties.BLOCK_MODE_GCM)
-                    .setEncryptionPaddings(android.security.keystore.KeyProperties.ENCRYPTION_PADDING_NONE)
-                    .setKeySize(256)
-                    .build()
-
-                keyGen.init(keyGenParameterSpec)
-                keyGen.generateKey()
-            }
-        } catch (_: Exception) {
-            // Fallback handled gracefully in local testing / robolectric
-        }
+        keyStoreDelegate.ensureKey(KEY_ALIAS)
     }
 
     private fun getSecretKey(): SecretKey? {
-        return try {
-            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-            (keyStore.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry)?.secretKey
-        } catch (_: Exception) {
-            null
-        }
+        return keyStoreDelegate.getKey(KEY_ALIAS)
     }
 
     /**
      * Encrypt and store the enrolled face feature vector.
-     * Fails closed if Android Keystore or SecretKey is unavailable.
+     * Re-ensures Android Keystore alias exists before encryption so delete -> re-enroll succeeds cleanly.
      */
     fun saveTemplate(vector: FloatArray, userName: String = "Primary Viewer"): Boolean {
         return try {
+            ensureKeyStoreKey()
+
             val byteBuffer = ByteBuffer.allocate(vector.size * 4)
             for (f in vector) {
                 byteBuffer.putFloat(f)
@@ -98,7 +147,12 @@ class FaceTemplateStore(private val context: Context) {
                 .putString(KEY_ENROLLED_USER_NAME, userName)
                 .apply()
             true
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            StayFrameServiceBridge.recordRecoverableException(
+                "template_encrypt_failed",
+                "Failed to encrypt and save enrolled facial template",
+                e
+            )
             false
         }
     }
@@ -126,7 +180,12 @@ class FaceTemplateStore(private val context: Context) {
                 result[i] = buffer.float
             }
             result
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            StayFrameServiceBridge.recordRecoverableException(
+                "template_decrypt_failed",
+                "Failed to decrypt enrolled facial template",
+                e
+            )
             null
         }
     }
@@ -154,14 +213,7 @@ class FaceTemplateStore(private val context: Context) {
             .remove(KEY_ENROLLED_USER_NAME)
             .apply()
 
-        try {
-            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-            if (keyStore.containsAlias(KEY_ALIAS)) {
-                keyStore.deleteEntry(KEY_ALIAS)
-            }
-        } catch (_: Exception) {
-            // Ignored
-        }
+        keyStoreDelegate.deleteKey(KEY_ALIAS)
     }
 
     /**

@@ -13,6 +13,7 @@ import com.example.domain.model.SyncSource
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 
 /**
  * Global singleton bridge coordinating Foreground Service, NotificationListener,
@@ -31,17 +32,35 @@ object StayFrameServiceBridge {
                 foregroundServiceInstance?.onPresenceStateChanged(newState, previousState)
             }
 
-            override fun onSendPauseCommand(targetPackage: String, currentPositionMs: Long) {
-                listenerServiceInstance?.sendPauseCommand(targetPackage)
+            override fun onSendPauseCommand(targetPackage: String, currentPositionMs: Long): Boolean {
+                val listener = listenerServiceInstance
+                if (listener == null) {
+                    reportNullListenerError("pause")
+                    return false
+                }
+                return listener.sendPauseCommand(targetPackage)
             }
 
-            override fun onSendRewindCommand(targetPackage: String, targetPositionMs: Long, rewindOffsetMs: Long) {
-                listenerServiceInstance?.sendRewindCommand(targetPackage, targetPositionMs)
-                _lastRewindOffsetMs.value = rewindOffsetMs
+            override fun onSendRewindCommand(targetPackage: String, targetPositionMs: Long, rewindOffsetMs: Long): Boolean {
+                val listener = listenerServiceInstance
+                if (listener == null) {
+                    reportNullListenerError("rewind")
+                    return false
+                }
+                val sent = listener.sendRewindCommand(targetPackage, targetPositionMs)
+                if (sent) {
+                    _lastRewindOffsetMs.value = rewindOffsetMs
+                }
+                return sent
             }
 
-            override fun onSendPlayCommand(targetPackage: String) {
-                listenerServiceInstance?.sendPlayCommand(targetPackage)
+            override fun onSendPlayCommand(targetPackage: String): Boolean {
+                val listener = listenerServiceInstance
+                if (listener == null) {
+                    reportNullListenerError("play")
+                    return false
+                }
+                return listener.sendPlayCommand(targetPackage)
             }
 
             override fun onDiagnosticLog(event: DiagnosticEvent) {
@@ -49,6 +68,13 @@ object StayFrameServiceBridge {
             }
         }
     )
+
+    private fun reportNullListenerError(commandName: String) {
+        val msg = "Notification Listener is disconnected; unable to send $commandName command. Re-enable Notification Access in Settings."
+        engine.reportError(msg)
+        _lastErrorMessage.value = engine.lastErrorMessage
+        _presenceState.value = engine.currentState
+    }
 
     private val _presenceState = MutableStateFlow(PresenceState.INACTIVE)
     val presenceState: StateFlow<PresenceState> = _presenceState.asStateFlow()
@@ -86,8 +112,23 @@ object StayFrameServiceBridge {
     private val _screenTimeoutMode = MutableStateFlow(ScreenTimeoutMode.OFF)
     val screenTimeoutMode: StateFlow<ScreenTimeoutMode> = _screenTimeoutMode.asStateFlow()
 
+    private val _listenerConnected = MutableStateFlow(false)
+    val listenerConnected: StateFlow<Boolean> = _listenerConnected.asStateFlow()
+
+    private val _lastErrorMessage = MutableStateFlow<String?>(null)
+    val lastErrorMessage: StateFlow<String?> = _lastErrorMessage.asStateFlow()
+
     var listenerServiceInstance: StayFrameNotificationListenerService? = null
+        set(value) {
+            field = value
+            _listenerConnected.value = value != null
+        }
+
     var foregroundServiceInstance: MonitoringForegroundService? = null
+
+    fun notifyTemplateChanged() {
+        foregroundServiceInstance?.refreshCachedTemplateAsync()
+    }
 
     fun setMonitoring(active: Boolean) {
         _isMonitoring.value = active
@@ -96,6 +137,7 @@ object StayFrameServiceBridge {
         } else {
             engine.stopMonitoring()
         }
+        _lastErrorMessage.value = engine.lastErrorMessage
         _presenceState.value = engine.currentState
         _effectiveGraceSeconds.value = engine.effectiveGracePeriodSeconds
         _remainingGraceSeconds.value = engine.getRemainingGraceSeconds()
@@ -121,18 +163,81 @@ object StayFrameServiceBridge {
     fun onFaceObserved(observation: FaceObservation) {
         _lastObservation.value = observation
         engine.processObservation(observation)
+        _lastErrorMessage.value = engine.lastErrorMessage
         _presenceState.value = engine.currentState
         _remainingGraceSeconds.value = engine.getRemainingGraceSeconds()
         _sustainedPresenceProgress.value = engine.getSustainedPresenceProgress()
     }
 
-    fun addDiagnosticEvent(event: DiagnosticEvent) {
-        val current = _diagnosticEvents.value.toMutableList()
-        current.add(0, event)
-        if (current.size > 100) {
-            current.removeAt(current.lastIndex)
+    fun reportCameraWatchdogTimeout(reason: String = "No camera frames received for >5s") {
+        engine.handleCameraWatchdogTimeout(reason = reason)
+        _lastErrorMessage.value = engine.lastErrorMessage
+        _presenceState.value = engine.currentState
+        _remainingGraceSeconds.value = engine.getRemainingGraceSeconds()
+    }
+
+    fun reportCameraError(errorMessage: String) {
+        engine.reportError(errorMessage)
+        _lastErrorMessage.value = engine.lastErrorMessage
+        _presenceState.value = engine.currentState
+    }
+
+    fun reportCameraRecovered(reason: String = "Camera hardware recovered") {
+        engine.recoverFromError(reason)
+        _lastErrorMessage.value = engine.lastErrorMessage
+        _presenceState.value = engine.currentState
+        _remainingGraceSeconds.value = engine.getRemainingGraceSeconds()
+    }
+
+    fun reportListenerDisconnectedError(errorMessage: String) {
+        engine.reportError(errorMessage)
+        _lastErrorMessage.value = engine.lastErrorMessage
+        _presenceState.value = engine.currentState
+    }
+
+    fun reportListenerReconnected() {
+        if (engine.currentState == PresenceState.ERROR &&
+            engine.lastErrorMessage?.contains("Notification Listener") == true
+        ) {
+            engine.recoverFromError("Notification Listener reconnected")
+            _lastErrorMessage.value = engine.lastErrorMessage
+            _presenceState.value = engine.currentState
+            _remainingGraceSeconds.value = engine.getRemainingGraceSeconds()
         }
-        _diagnosticEvents.value = current
+    }
+
+    fun reportForegroundStartFailure(errorMessage: String) {
+        _isMonitoring.value = false
+        engine.reportError(errorMessage)
+        _lastErrorMessage.value = engine.lastErrorMessage
+        _presenceState.value = engine.currentState
+    }
+
+    fun recordRecoverableException(eventName: String, contextMessage: String, error: Throwable) {
+        val detail = "$contextMessage (${error.javaClass.simpleName}: ${error.message ?: "unknown"})"
+        try {
+            android.util.Log.w("StayFrame", detail, error)
+        } catch (_: Throwable) {
+            // Pure JVM unit tests without Android Log mock
+        }
+        addDiagnosticEvent(
+            DiagnosticEvent(
+                state = _presenceState.value,
+                eventName = eventName,
+                details = detail
+            )
+        )
+    }
+
+    fun addDiagnosticEvent(event: DiagnosticEvent) {
+        _diagnosticEvents.update { current ->
+            val next = ArrayList<DiagnosticEvent>(minOf(current.size + 1, 100))
+            next.add(event)
+            for (i in 0 until minOf(current.size, 99)) {
+                next.add(current[i])
+            }
+            next
+        }
     }
 
     fun clearDiagnosticEvents() {

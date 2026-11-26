@@ -1,6 +1,7 @@
 package com.example
 
 import android.Manifest
+import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -85,6 +86,10 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: StayFrameViewModel by viewModels()
 
+    companion object {
+        const val EXTRA_RESUME_MONITORING = "com.stayframe.extra.RESUME_MONITORING"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -93,6 +98,21 @@ class MainActivity : ComponentActivity() {
             StayFrameTheme {
                 StayFrameApp(viewModel = viewModel)
             }
+        }
+
+        handleResumeIntentIfRequested(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleResumeIntentIfRequested(intent)
+    }
+
+    private fun handleResumeIntentIfRequested(launchIntent: Intent?) {
+        if (launchIntent?.getBooleanExtra(EXTRA_RESUME_MONITORING, false) == true) {
+            launchIntent.removeExtra(EXTRA_RESUME_MONITORING)
+            viewModel.resumeMonitoringFromNotification()
         }
     }
 

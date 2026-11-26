@@ -140,6 +140,7 @@ data class ActiveMediaSessionInfo(
     val packageName: String? = null,
     val playerDisplayName: String = "No Active Player",
     val isPlaying: Boolean = false,
+    val isBuffering: Boolean = false,
     val playbackPositionMs: Long = 0L,
     val isSupported: Boolean = false,
     val canSeek: Boolean = true,

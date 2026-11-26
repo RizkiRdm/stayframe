@@ -49,6 +49,8 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
     val effectiveGraceSeconds: StateFlow<Int> = StayFrameServiceBridge.effectiveGraceSeconds
     val activeSyncSource: StateFlow<SyncSource> = StayFrameServiceBridge.activeSyncSource
     val sustainedPresenceProgress: StateFlow<Float> = StayFrameServiceBridge.sustainedPresenceProgress
+    val listenerConnected: StateFlow<Boolean> = StayFrameServiceBridge.listenerConnected
+    val lastErrorMessage: StateFlow<String?> = StayFrameServiceBridge.lastErrorMessage
     val presenceEngineLastErrorMessage: String? get() = StayFrameServiceBridge.engine.lastErrorMessage
 
     // Dynamic Player Registry
@@ -172,6 +174,23 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
         return true
     }
 
+    fun resumeMonitoringFromNotification(): Boolean {
+        if (isMonitoring.value) {
+            return true
+        }
+        val started = startMonitoring()
+        if (started) {
+            StayFrameServiceBridge.addDiagnosticEvent(
+                DiagnosticEvent(
+                    state = presenceState.value,
+                    eventName = "recovery_resumed_by_tap",
+                    details = "Monitoring restarted from foreground tap-to-resume notification"
+                )
+            )
+        }
+        return started
+    }
+
     fun stopMonitoring() {
         viewModelScope.launch {
             preferencesRepository.setMonitoringArmed(false)
@@ -257,6 +276,7 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
     fun enrollFace(name: String, descriptor: FloatArray, activateStrictMode: Boolean = true): Boolean {
         val success = templateStore.saveTemplate(descriptor, name)
         if (success) {
+            StayFrameServiceBridge.notifyTemplateChanged()
             _isEnrolled.value = true
             _enrolledUserName.value = name
             _enrolledTimestamp.value = templateStore.getEnrolledTimestamp()
@@ -280,6 +300,7 @@ class StayFrameViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun deleteEnrollment() {
         templateStore.deleteTemplate()
+        StayFrameServiceBridge.notifyTemplateChanged()
         _isEnrolled.value = false
         _enrolledUserName.value = "Primary Viewer"
         _enrolledTimestamp.value = 0L

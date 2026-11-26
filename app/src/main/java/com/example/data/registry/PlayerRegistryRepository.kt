@@ -6,6 +6,7 @@ import android.os.Build
 import com.example.domain.model.DiscoverySource
 import com.example.domain.model.PlayerRegistry
 import com.example.domain.model.PlayerVerificationStatus
+import com.example.service.StayFrameServiceBridge
 import com.example.domain.model.SessionCapabilities
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -191,7 +192,12 @@ class PlayerRegistryRepository(
                 pm.getApplicationInfo(packageName, 0)
             }
             pm.getApplicationLabel(appInfo).toString()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            StayFrameServiceBridge.recordRecoverableException(
+                "player_label_lookup_failed",
+                "Failed to resolve application label for $packageName",
+                e
+            )
             null
         }
     }

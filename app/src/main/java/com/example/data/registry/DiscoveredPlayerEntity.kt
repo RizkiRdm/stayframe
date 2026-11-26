@@ -24,13 +24,23 @@ data class DiscoveredPlayerEntity(
 ) {
     fun statusEnum(): PlayerVerificationStatus = try {
         PlayerVerificationStatus.valueOf(verificationStatus)
-    } catch (_: Exception) {
+    } catch (e: Exception) {
+        com.example.service.StayFrameServiceBridge.recordRecoverableException(
+            "player_status_parse_failed",
+            "Unknown PlayerVerificationStatus '$verificationStatus' for $packageName",
+            e
+        )
         PlayerVerificationStatus.CANDIDATE
     }
 
     fun sourceEnum(): DiscoverySource = try {
         DiscoverySource.valueOf(discoverySource)
-    } catch (_: Exception) {
+    } catch (e: Exception) {
+        com.example.service.StayFrameServiceBridge.recordRecoverableException(
+            "player_source_parse_failed",
+            "Unknown DiscoverySource '$discoverySource' for $packageName",
+            e
+        )
         DiscoverySource.INTENT_SCAN
     }
 

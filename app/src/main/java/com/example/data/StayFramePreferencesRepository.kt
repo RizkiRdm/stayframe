@@ -11,6 +11,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.domain.model.DetectionMode
 import com.example.domain.model.ScreenTimeoutMode
+import com.example.service.StayFrameServiceBridge
 import java.io.IOException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -50,7 +51,12 @@ class StayFramePreferencesRepository(private val context: Context) {
             val detectionMode = if (detectionModeStr != null) {
                 try {
                     DetectionMode.valueOf(detectionModeStr)
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    StayFrameServiceBridge.recordRecoverableException(
+                        "prefs_detection_mode_parse_failed",
+                        "Invalid stored DetectionMode '$detectionModeStr'; falling back to RELAXED_FALLBACK",
+                        e
+                    )
                     DetectionMode.RELAXED_FALLBACK
                 }
             } else {
@@ -61,7 +67,12 @@ class StayFramePreferencesRepository(private val context: Context) {
             val screenTimeoutMode = if (screenTimeoutStr != null) {
                 try {
                     ScreenTimeoutMode.valueOf(screenTimeoutStr)
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    StayFrameServiceBridge.recordRecoverableException(
+                        "prefs_screen_timeout_parse_failed",
+                        "Invalid stored ScreenTimeoutMode '$screenTimeoutStr'; falling back to MIN_15",
+                        e
+                    )
                     ScreenTimeoutMode.MIN_15
                 }
             } else {

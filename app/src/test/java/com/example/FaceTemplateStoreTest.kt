@@ -60,4 +60,48 @@ class FaceTemplateStoreTest {
         assertEquals(0.0f, store.computeCosineSimilarity(floatArrayOf(), floatArrayOf()), 0.001f)
         assertEquals(0.0f, store.computeCosineSimilarity(floatArrayOf(1f), floatArrayOf(1f, 2f)), 0.001f)
     }
+
+    @Test
+    fun testT6_DeleteThenReEnroll_CallsEnsureKeyStoreKeyAndRoundTrips() {
+        var ensureCalls = 0
+        var deleteCalls = 0
+        val keys = mutableMapOf<String, javax.crypto.SecretKey>()
+        val delegate = object : FaceTemplateStore.KeyStoreDelegate {
+            override fun ensureKey(alias: String) {
+                ensureCalls++
+                if (!keys.containsKey(alias)) {
+                    val keyGen = javax.crypto.KeyGenerator.getInstance("AES").apply { init(256) }
+                    keys[alias] = keyGen.generateKey()
+                }
+            }
+
+            override fun getKey(alias: String): javax.crypto.SecretKey? = keys[alias]
+
+            override fun deleteKey(alias: String) {
+                deleteCalls++
+                keys.remove(alias)
+            }
+        }
+
+        val secureStore = FaceTemplateStore(context, delegate)
+        assertEquals(1, ensureCalls)
+
+        val firstVector = floatArrayOf(0.15f, 0.45f, 0.85f)
+        assertTrue(secureStore.saveTemplate(firstVector, "Viewer One"))
+        assertEquals(2, ensureCalls)
+        assertTrue(secureStore.isEnrolled())
+        org.junit.Assert.assertArrayEquals(firstVector, secureStore.getTemplate(), 0.0001f)
+
+        secureStore.deleteTemplate()
+        assertEquals(1, deleteCalls)
+        assertFalse(secureStore.isEnrolled())
+        assertNull(secureStore.getTemplate())
+
+        val secondVector = floatArrayOf(0.75f, 0.25f, 0.60f)
+        assertTrue(secureStore.saveTemplate(secondVector, "Viewer Two"))
+        assertEquals(3, ensureCalls)
+        assertTrue(secureStore.isEnrolled())
+        assertEquals("Viewer Two", secureStore.getEnrolledUserName())
+        org.junit.Assert.assertArrayEquals(secondVector, secureStore.getTemplate(), 0.0001f)
+    }
 }

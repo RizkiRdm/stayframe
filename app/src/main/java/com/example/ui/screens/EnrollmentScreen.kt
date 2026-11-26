@@ -488,10 +488,22 @@ private fun EnrollmentCameraPreview(
         onDispose {
             try {
                 boundProvider?.unbindAll()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                com.example.service.StayFrameServiceBridge.recordRecoverableException(
+                    "enrollment_camera_unbind_failed",
+                    "Failed to unbind enrollment camera preview",
+                    e
+                )
+            }
             try {
                 faceDetector.close()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                com.example.service.StayFrameServiceBridge.recordRecoverableException(
+                    "enrollment_detector_close_failed",
+                    "Failed to close enrollment FaceDetector",
+                    e
+                )
+            }
             cameraExecutor.shutdown()
         }
     }
@@ -565,6 +577,11 @@ private fun EnrollmentCameraPreview(
                                         imageProxy.close()
                                     }
                             } catch (e: Exception) {
+                                com.example.service.StayFrameServiceBridge.recordRecoverableException(
+                                    "enrollment_frame_error",
+                                    "Failed to process enrollment camera frame",
+                                    e
+                                )
                                 imageProxy.close()
                             }
                         }
